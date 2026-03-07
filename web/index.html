@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Browser Mic Transcription</title>
+  <style>
+    body { font-family: Segoe UI, sans-serif; margin: 24px; background: #f3f6fb; color: #1c2635; }
+    .card { max-width: 900px; margin: 0 auto; background: #ffffff; border-radius: 14px; padding: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; font-weight: 600; cursor: pointer; }
+    button.start { background: #1f7a46; color: #fff; }
+    button.stop { background: #9f2b2b; color: #fff; }
+    #status { font-weight: 600; }
+    #out { background: #0e1725; color: #dce5f4; border-radius: 10px; padding: 12px; min-height: 220px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Browser Microphone to Server Transcription</h2>
+    <div class="row">
+      <button id="startBtn" class="start">Start</button>
+      <button id="stopBtn" class="stop" disabled>Stop</button>
+      <label><input type="checkbox" id="saveSample" /> Save WAV capture</label>
+      <label>Chunk (s): <input id="chunkSeconds" type="number" min="0.2" step="0.1" value="1.5" style="width:72px" /></label>
+      <label>Overlap (s): <input id="overlapSeconds" type="number" min="0.0" step="0.05" value="0.25" style="width:72px" /></label>
+      <span id="status">Idle</span>
+    </div>
+    <div id="out"></div>
+  </div>
+  <script>
+    let pc = null;
+    let stream = null;
+    let source = null;
+    let sessionId = null;
+
+    const out = document.getElementById("out");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const saveSample = document.getElementById("saveSample");
+    const chunkSeconds = document.getElementById("chunkSeconds");
+    const overlapSeconds = document.getElementById("overlapSeconds");
+
+    function setStatus(v) { statusEl.textContent = v; }
+    function appendLine(v) {
+      out.textContent += (out.textContent ? "\n" : "") + v;
+      out.scrollTop = out.scrollHeight;
+    }
+
+    function waitIceGathering(pc) {
+      if (pc.iceGatheringState === "complete") return Promise.resolve();
+      return new Promise((resolve) => {
+        const check = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            resolve();
+          }
+        };
+        pc.addEventListener("icegatheringstatechange", check);
+      });
+    }
+
+    async function start() {
+      sessionId = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+      setStatus("Requesting microphone...");
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+      });
+
+      pc = new RTCPeerConnection();
+      pc.onconnectionstatechange = () => setStatus("WebRTC: " + pc.connectionState);
+      for (const track of stream.getTracks()) {
+        pc.addTrack(track, stream);
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIceGathering(pc);
+
+      const response = await fetch("/offer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type,
+          session_id: sessionId,
+          save_sample: !!saveSample.checked,
+          chunk_seconds: Number(chunkSeconds.value),
+          overlap_seconds: Number(overlapSeconds.value)
+        })
+      });
+      if (!response.ok) {
+        const txt = await response.text();
+        throw new Error("Offer failed: " + txt);
+      }
+      const answer = await response.json();
+      await pc.setRemoteDescription(answer);
+
+      source = new EventSource("/events/" + sessionId);
+      source.onmessage = (evt) => appendLine(evt.data);
+      source.onerror = () => setStatus("Event stream disconnected");
+
+      setStatus("Streaming microphone to server");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    }
+
+    async function stop() {
+      stopBtn.disabled = true;
+      startBtn.disabled = false;
+      setStatus("Stopping...");
+      if (source) {
+        source.close();
+        source = null;
+      }
+      if (pc) {
+        pc.getSenders().forEach((s) => s.track && s.track.stop());
+        pc.close();
+        pc = null;
+      }
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+      }
+      if (sessionId) {
+        try { await fetch("/session/" + sessionId, { method: "DELETE" }); } catch (_) {}
+      }
+      setStatus("Idle");
+    }
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        await start();
+      } catch (err) {
+        setStatus("Error");
+        appendLine("[client error] " + String(err));
+        await stop();
+      }
+    });
+    stopBtn.addEventListener("click", stop);
+  </script>
+</body>
+</html>

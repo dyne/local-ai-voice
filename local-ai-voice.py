@@ -8,13 +8,16 @@ import wave
 
 import numpy as np
 
+from network_guard import enable_loopback_only_network
+from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
+from voice_runtime import (
+    DeviceListRequested,
+    PipelineSetupError,
+    create_whisper_runtime,
+    likely_reason_details,
+)
+
 TARGET_SAMPLE_RATE = 16000
-DEFAULT_DEVICE_ORDER = ("NPU", "GPU", "CPU")
-DEFAULT_MODEL_FOR_DEVICE = {
-    "NPU": "whisper-base.en-int8-ov",
-    "GPU": "whisper-tiny-fp16-ov",
-    "CPU": "whisper-tiny-fp16-ov",
-}
 SILENCE_DB_THRESHOLD = -45.0
 SILENCE_MIN_LENGTH_MS = 5000
 SILENCE_MIN_INTERVAL_MS = 300
@@ -135,33 +138,6 @@ def discard_silence(
     return trimmed
 
 
-def parse_device_preference(raw: str) -> tuple[str, ...]:
-    stripped = raw.strip().upper()
-    if stripped == "LIST":
-        return ("LIST",)
-    parts = [p.strip() for p in stripped.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("Device list is empty.")
-    invalid = [p for p in parts if p not in DEFAULT_DEVICE_ORDER]
-    if invalid:
-        raise ValueError(f"Unsupported device value(s): {', '.join(invalid)}. Use only NPU,GPU,CPU or list.")
-    return tuple(parts)
-
-
-def query_available_devices() -> list[str]:
-    try:
-        import openvino as ov
-
-        return list(ov.Core().available_devices)
-    except Exception:
-        try:
-            from openvino.runtime import Core
-
-            return list(Core().available_devices)
-        except Exception:
-            return []
-
-
 def configure_openvino_runtime_env() -> None:
     # Frozen builds may need explicit plugin search paths for OpenVINO runtime.
     candidates: list[pathlib.Path] = []
@@ -203,30 +179,6 @@ def configure_openvino_runtime_env() -> None:
     os.environ["OPENVINO_LIB_PATHS"] = path_sep.join(merged)
 
 
-def pick_first_available_device(preferred: tuple[str, ...], available: list[str]) -> str | None:
-    for want in preferred:
-        if any(dev == want or dev.startswith(f"{want}.") for dev in available):
-            return want
-    return None
-
-
-def resolve_model_dir(args: argparse.Namespace, selected_device: str) -> pathlib.Path:
-    if args.model is not None:
-        return args.model
-    return pathlib.Path(__file__).resolve().parent / DEFAULT_MODEL_FOR_DEVICE[selected_device]
-
-
-def build_generate_kwargs(args: argparse.Namespace) -> dict[str, object]:
-    kwargs: dict[str, object] = {}
-    if args.language:
-        kwargs["language"] = args.language
-    if args.task:
-        kwargs["task"] = args.task
-    if args.timestamps:
-        kwargs["return_timestamps"] = True
-    return kwargs
-
-
 def result_to_text(result: object) -> str:
     if isinstance(result, str):
         return result
@@ -239,22 +191,17 @@ def result_to_text(result: object) -> str:
     return str(result)
 
 
-def likely_reason_details(exc: Exception) -> list[str]:
-    message = str(exc)
-    details = [f"Runtime error: {message}"]
-    if "Upper bounds were not specified" in message:
-        details.append("NPU compiler rejected dynamic bounds for this model/runtime combination.")
-    if "OpenVINO and OpenVINO Tokenizers versions are not binary compatible" in message:
-        details.append("Align package versions: pip install -U openvino openvino-genai openvino-tokenizers")
-    if "openvino_tokenizers.dll" in message:
-        details.append("Frozen build is missing tokenizer runtime library; rebuild with tokenizer binaries/data included.")
-    details.append("Ensure OpenVINO runtime, drivers, and model export are compatible.")
-    return details
-
-
 def transcribe_chunk(pipe: object, audio: np.ndarray, generate_kwargs: dict[str, object]) -> str:
     result = pipe.generate(audio.tolist(), **generate_kwargs)
     return result_to_text(result).strip()
+
+
+def setup_error_exit_code(reason: str) -> int:
+    if reason.startswith("Model directory not found:"):
+        return 2
+    if reason.startswith("Failed to create WhisperPipeline on "):
+        return 4
+    return 3
 
 
 def run_file_mode(
@@ -418,77 +365,55 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="Live mode chunk duration in seconds (used when wav_path is omitted).",
     )
+    parser.add_argument("--profile", action="store_true", help="Enable py-spy profiling for this run.")
+    parser.add_argument(
+        "--profile-output",
+        type=pathlib.Path,
+        default=None,
+        help="Optional py-spy output SVG path (default: profiles/<timestamp>.svg).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print progress logs to stderr.")
     return parser.parse_args()
 
 
 def main() -> int:
+    enable_loopback_only_network()
     args = parse_args()
-    start = time.perf_counter()
-    configure_openvino_runtime_env()
-
+    profile_session = start_py_spy_profile(
+        enabled=args.profile,
+        label="local-ai-voice",
+        output_path=args.profile_output,
+    )
     try:
-        preferred_devices = parse_device_preference(args.device)
-    except ValueError as exc:
-        return fail(str(exc), exit_code=2)
+        start = time.perf_counter()
+        configure_openvino_runtime_env()
 
-    available = query_available_devices()
-    if preferred_devices == ("LIST",):
-        if not available:
-            print("No OpenVINO devices detected")
-            return 1
-        for dev in available:
-            print(dev)
-        return 0
-    if not available:
-        details = ["Check OpenVINO installation and drivers."]
-        if getattr(sys, "frozen", False):
-            details.append("Frozen build may be missing OpenVINO runtime plugins (CPU/NPU/GPU). Rebuild with collected binaries/data.")
-        return fail("No OpenVINO devices detected.", details, exit_code=3)
+        try:
+            runtime = create_whisper_runtime(
+                args=args,
+                base_dir=pathlib.Path(__file__).resolve().parent,
+                logger=log,
+                verbose=args.verbose,
+                start_time=start,
+            )
+        except DeviceListRequested as exc:
+            if not exc.devices:
+                print("No OpenVINO devices detected")
+                return 1
+            for dev in exc.devices:
+                print(dev)
+            return 0
+        except PipelineSetupError as exc:
+            return fail(exc.reason, exc.details, exit_code=setup_error_exit_code(exc.reason))
 
-    selected_device = pick_first_available_device(preferred_devices, available)
-    if selected_device is None:
-        return fail(
-            "No requested device is available.",
-            [f"Requested order: {', '.join(preferred_devices)}", f"Detected devices: {', '.join(available)}"],
-            exit_code=3,
-        )
-    log(f"Requested device order: {', '.join(preferred_devices)}", args.verbose, start)
-    log(f"Selected device: {selected_device}", args.verbose, start)
-
-    model_dir = resolve_model_dir(args, selected_device)
-    if not model_dir.exists():
-        return fail(
-            f"Model directory not found: {model_dir}",
-            [f"Selected device: {selected_device}", "Pass --model with a valid local Whisper OpenVINO model directory."],
-            exit_code=2,
-        )
-    log(f"Model directory: {model_dir}", args.verbose, start)
-
-    try:
-        import openvino_genai as ov_genai
-    except Exception as exc:
-        return fail(
-            "openvino_genai is not available.",
-            [f"Import error: {exc}", "Install OpenVINO GenAI and retry."],
-            exit_code=3,
-        )
-
-    try:
-        # STATIC_PIPELINE is required for stable Whisper execution on NPU.
-        pipe = ov_genai.WhisperPipeline(str(model_dir), selected_device, STATIC_PIPELINE=True)
-    except Exception as exc:
-        return fail(
-            f"Failed to create WhisperPipeline on {selected_device}.",
-            likely_reason_details(exc),
-            exit_code=4,
-        )
-
-    generate_kwargs = build_generate_kwargs(args)
-    status = run_file_mode(args, pipe, generate_kwargs, start) if args.wav_path else run_live_mode(args, pipe, generate_kwargs, start)
-    if status == 0:
-        log(f"Done in {time.perf_counter() - start:.2f}s", args.verbose, start)
-    return status
+        pipe = runtime.pipe
+        generate_kwargs = runtime.generate_kwargs
+        status = run_file_mode(args, pipe, generate_kwargs, start) if args.wav_path else run_live_mode(args, pipe, generate_kwargs, start)
+        if status == 0:
+            log(f"Done in {time.perf_counter() - start:.2f}s", args.verbose, start)
+        return status
+    finally:
+        stop_py_spy_profile(profile_session)
 
 
 if __name__ == "__main__":
