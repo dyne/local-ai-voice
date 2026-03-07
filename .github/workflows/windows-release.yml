@@ -1,0 +1,89 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av
+          python -m pip install --upgrade openvino openvino-genai openvino-tokenizers
+
+      - name: Generate PyInstaller spec
+        shell: pwsh
+        run: |
+          if (Test-Path local-ai-voice.spec) {
+            Remove-Item local-ai-voice.spec -Force
+          }
+          python -m PyInstaller.utils.cliutils.makespec --onefile --name local-ai-voice `
+            --hidden-import browser_webrtc `
+            --hidden-import av `
+            --hidden-import noisereduce `
+            --hidden-import webrtcvad `
+            --additional-hooks-dir hooks `
+            --collect-binaries openvino `
+            --collect-data openvino `
+            --collect-binaries openvino_genai `
+            --collect-data openvino_genai `
+            --collect-binaries openvino_tokenizers `
+            --collect-data openvino_tokenizers `
+            --add-data "web/index.html;web" `
+            local-ai-voice.py
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --clean local-ai-voice.spec
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $asset = "local-ai-voice-windows-x64.zip"
+          $stage = "release-package"
+          if (Test-Path $asset) {
+            Remove-Item $asset -Force
+          }
+          if (Test-Path $stage) {
+            Remove-Item $stage -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item dist\local-ai-voice.exe $stage\
+          Copy-Item README.md $stage\
+          Copy-Item AGENTS.md $stage\
+          Get-ChildItem -Path . -Filter "LICENSE*" -File | ForEach-Object {
+            Copy-Item $_.FullName $stage\
+          }
+          Compress-Archive -Path "$stage\*" -DestinationPath $asset
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-voice-windows-x64
+          path: local-ai-voice-windows-x64.zip
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: local-ai-voice-windows-x64.zip
