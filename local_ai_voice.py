@@ -19,13 +19,29 @@ from voice_runtime import (
 )
 
 TARGET_SAMPLE_RATE = 16000
+SUPPORTED_VAD_SAMPLE_RATES = (8000, 16000, 32000, 48000)
 VAD_FRAME_MS = 30
-VAD_MODE = 2
+VAD_MODE = 3
 VAD_MIN_SPEECH_FRAMES = 3
 VAD_MIN_SPEECH_RATIO = 0.2
 VAD_MIN_UTTERANCE_MS = 180
 VAD_HANGOVER_MS = 300
 NR_IMPORT_ERROR = "Install noisereduce and webrtcvad-wheels."
+WEAK_SPEECH_RATIO_MARGIN = 0.08
+WEAK_SPEECH_FRAMES_MARGIN = 1
+WEAK_UTTERANCE_MS_MARGIN = 60
+COMMON_WEAK_HALLUCINATIONS = {
+    ".",
+    ",",
+    "?",
+    "!",
+    "...",
+    "you",
+    "uh",
+    "um",
+    "hmm",
+    "hm",
+}
 
 
 @dataclass
@@ -38,6 +54,10 @@ class AudioPreprocessor:
     min_utterance_ms: int
     hangover_ms: int
     hangover_frames: int = 0
+    last_speech_frames: int = 0
+    last_total_frames: int = 0
+    last_max_run: int = 0
+    last_was_hangover: bool = False
 
 
 def log(message: str, verbose: bool, start_time: float | None = None) -> None:
@@ -145,9 +165,25 @@ def create_audio_preprocessor(
     )
 
 
-def speech_frame_stats(audio: np.ndarray, vad: object) -> tuple[int, int, int]:
-    frame_samples = TARGET_SAMPLE_RATE * VAD_FRAME_MS // 1000
-    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+def normalize_audio_format(audio: np.ndarray) -> np.ndarray:
+    return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+def preferred_vad_sample_rate(sample_rate: int) -> int:
+    return min(SUPPORTED_VAD_SAMPLE_RATES, key=lambda rate: abs(rate - sample_rate))
+
+
+def prepare_vad_audio(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
+    if sample_rate in SUPPORTED_VAD_SAMPLE_RATES:
+        return normalize_audio_format(audio), sample_rate
+    vad_sample_rate = preferred_vad_sample_rate(sample_rate)
+    return resample_audio_linear(normalize_audio_format(audio), sample_rate, vad_sample_rate), vad_sample_rate
+
+
+def speech_frame_stats(audio: np.ndarray, vad: object, sample_rate: int) -> tuple[int, int, int]:
+    vad_audio, vad_sample_rate = prepare_vad_audio(audio, sample_rate)
+    frame_samples = vad_sample_rate * VAD_FRAME_MS // 1000
+    pcm16 = (np.clip(vad_audio, -1.0, 1.0) * 32767.0).astype(np.int16)
     if pcm16.size == 0:
         return 0, 0, 0
     speech_frames = 0
@@ -161,7 +197,7 @@ def speech_frame_stats(audio: np.ndarray, vad: object) -> tuple[int, int, int]:
         if frame.size < frame_samples:
             frame = np.pad(frame, (0, frame_samples - frame.size))
         total_frames += 1
-        if vad.is_speech(frame.tobytes(), TARGET_SAMPLE_RATE):
+        if vad.is_speech(frame.tobytes(), vad_sample_rate):
             speech_frames += 1
             consecutive += 1
             if consecutive > max_consecutive:
@@ -175,20 +211,29 @@ def _speech_detected(
     original_audio: np.ndarray,
     reduced_audio: np.ndarray,
     preprocessor: AudioPreprocessor,
+    sample_rate: int,
 ) -> bool:
     min_duration_frames = max(1, int(np.ceil(preprocessor.min_utterance_ms / float(VAD_FRAME_MS))))
     hangover_frames = max(1, int(np.ceil(preprocessor.hangover_ms / float(VAD_FRAME_MS))))
 
-    orig_speech, orig_total, orig_run = speech_frame_stats(original_audio, preprocessor.vad)
-    red_speech, red_total, red_run = speech_frame_stats(reduced_audio, preprocessor.vad)
+    orig_speech, orig_total, orig_run = speech_frame_stats(original_audio, preprocessor.vad, sample_rate)
+    red_speech, red_total, red_run = speech_frame_stats(reduced_audio, preprocessor.vad, sample_rate)
     total_frames = max(orig_total, red_total)
     if total_frames == 0:
         preprocessor.hangover_frames = 0
+        preprocessor.last_speech_frames = 0
+        preprocessor.last_total_frames = 0
+        preprocessor.last_max_run = 0
+        preprocessor.last_was_hangover = False
         return False
 
     speech_frames = max(orig_speech, red_speech)
-    speech_ratio = speech_frames / float(total_frames)
     consecutive_run = max(orig_run, red_run)
+    preprocessor.last_speech_frames = speech_frames
+    preprocessor.last_total_frames = total_frames
+    preprocessor.last_max_run = consecutive_run
+    preprocessor.last_was_hangover = False
+    speech_ratio = speech_frames / float(total_frames)
     speech_now = (
         consecutive_run >= preprocessor.min_speech_frames
         and speech_frames >= min_duration_frames
@@ -199,28 +244,30 @@ def _speech_detected(
         return True
     if preprocessor.hangover_frames > 0:
         preprocessor.hangover_frames -= min(total_frames, preprocessor.hangover_frames)
+        preprocessor.last_was_hangover = True
         return True
     return False
 
 
 def preprocess_audio(
     audio: np.ndarray,
+    sample_rate: int,
     preprocessor: object | None,
     verbose: bool,
     start: float,
 ) -> np.ndarray:
     if preprocessor is None:
-        return np.asarray(audio, dtype=np.float32, copy=False)
-    original_audio = np.asarray(audio, dtype=np.float32, copy=False)
+        return normalize_audio_format(audio)
+    original_audio = normalize_audio_format(audio)
     try:
-        reduced = preprocessor.nr.reduce_noise(y=original_audio, sr=TARGET_SAMPLE_RATE)
+        reduced = preprocessor.nr.reduce_noise(y=original_audio, sr=sample_rate)
     except Exception as exc:
         raise RuntimeError("Noise reduction failed.") from exc
 
-    reduced_audio = np.asarray(reduced, dtype=np.float32).reshape(-1)
+    reduced_audio = normalize_audio_format(reduced)
     if reduced_audio.size == 0:
         return reduced_audio
-    if not _speech_detected(original_audio, reduced_audio, preprocessor):
+    if not _speech_detected(original_audio, reduced_audio, preprocessor, sample_rate):
         log("Audio skipped: no speech detected by VAD", verbose, start)
         return np.asarray([], dtype=np.float32)
     return reduced_audio
@@ -283,6 +330,37 @@ def transcribe_chunk(pipe: object, audio: np.ndarray, generate_kwargs: dict[str,
     return result_to_text(result).strip()
 
 
+def _is_common_weak_hallucination(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    if normalized in COMMON_WEAK_HALLUCINATIONS:
+        return True
+    if all(ch in ".,!?:;-'\"()[]{} " for ch in normalized):
+        return True
+    return False
+
+
+def should_suppress_transcript(text: str, preprocessor: object | None) -> bool:
+    if preprocessor is None or not isinstance(preprocessor, AudioPreprocessor):
+        return False
+    if not text:
+        return False
+    if not _is_common_weak_hallucination(text):
+        return False
+    if preprocessor.last_total_frames <= 0:
+        return False
+    speech_ratio = preprocessor.last_speech_frames / float(preprocessor.last_total_frames)
+    min_duration_frames = max(1, int(np.ceil(preprocessor.min_utterance_ms / float(VAD_FRAME_MS))))
+    weak_ratio = speech_ratio <= (preprocessor.min_speech_ratio + WEAK_SPEECH_RATIO_MARGIN)
+    weak_frames = preprocessor.last_speech_frames <= (min_duration_frames + WEAK_SPEECH_FRAMES_MARGIN)
+    weak_run = preprocessor.last_max_run <= (preprocessor.min_speech_frames + WEAK_SPEECH_FRAMES_MARGIN)
+    weak_duration = (preprocessor.last_speech_frames * VAD_FRAME_MS) <= (
+        preprocessor.min_utterance_ms + WEAK_UTTERANCE_MS_MARGIN
+    )
+    return preprocessor.last_was_hangover or ((weak_ratio and weak_frames) or (weak_run and weak_duration))
+
+
 def setup_error_exit_code(reason: str) -> int:
     if reason.startswith("Model directory not found:"):
         return 2
@@ -305,9 +383,8 @@ def run_file_mode(
 
     log("Reading WAV", args.verbose, start)
     audio, sample_rate = read_wav_mono_float32(args.wav_path)
-    audio, sample_rate = ensure_sample_rate(audio, sample_rate, args.verbose, start)
     try:
-        audio = preprocess_audio(audio, audio_preprocessor, args.verbose, start)
+        audio = preprocess_audio(audio, sample_rate, audio_preprocessor, args.verbose, start)
     except Exception as exc:
         return fail(
             "Audio preprocessing failed.",
@@ -316,12 +393,15 @@ def run_file_mode(
         )
     if audio.size == 0:
         return fail("No speech detected.", ["Input appears silent after noise reduction."], exit_code=2)
+    audio, sample_rate = ensure_sample_rate(audio, sample_rate, args.verbose, start)
     log(f"Audio prepared: samples={audio.shape[0]}, sample_rate={sample_rate} Hz", args.verbose, start)
 
     try:
         text = transcribe_chunk(pipe, audio, generate_kwargs)
     except Exception as exc:
         return fail("Transcription failed.", likely_reason_details(exc), exit_code=5)
+    if should_suppress_transcript(text, audio_preprocessor):
+        return fail("No speech detected.", ["Input appears to contain only weak non-speech noise."], exit_code=2)
 
     print(text)
     return 0
@@ -387,10 +467,8 @@ def run_live_mode(
                 audio = np.asarray(data[:, 0], dtype=np.float32)
                 if np.max(np.abs(audio), initial=0.0) < 1e-4:
                     continue
-                if record_sample_rate != TARGET_SAMPLE_RATE:
-                    audio = resample_audio_linear(audio, record_sample_rate, TARGET_SAMPLE_RATE)
                 try:
-                    audio = preprocess_audio(audio, audio_preprocessor, args.verbose, start)
+                    audio = preprocess_audio(audio, record_sample_rate, audio_preprocessor, args.verbose, start)
                 except Exception as exc:
                     return fail(
                         "Live audio preprocessing failed.",
@@ -399,13 +477,15 @@ def run_live_mode(
                     )
                 if args.silence_detect and audio.size == 0:
                     continue
+                if record_sample_rate != TARGET_SAMPLE_RATE:
+                    audio = resample_audio_linear(audio, record_sample_rate, TARGET_SAMPLE_RATE)
 
                 try:
                     text = transcribe_chunk(pipe, audio, generate_kwargs)
                 except Exception as exc:
                     return fail("Live transcription failed.", likely_reason_details(exc), exit_code=5)
 
-                if text:
+                if text and not should_suppress_transcript(text, audio_preprocessor):
                     print(f"[chunk {chunk_index}] {text}", flush=True)
     except KeyboardInterrupt:
         print("\nStopped live transcription.", file=sys.stderr, flush=True)

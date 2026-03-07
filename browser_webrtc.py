@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import pathlib
 import sys
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
+import av
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from network_guard import enable_loopback_only_network
@@ -21,26 +23,31 @@ from local_ai_voice import (
     configure_openvino_runtime_env,
     create_audio_preprocessor,
     log,
+    normalize_audio_format,
     preprocess_audio,
     resample_audio_linear,
+    should_suppress_transcript,
     transcribe_chunk,
 )
 from voice_runtime import DeviceListRequested, PipelineSetupError, create_whisper_runtime, likely_reason_details
 
 DEFAULT_CHUNK_SECONDS = 1.5
-DEFAULT_OVERLAP_SECONDS = 0.25
+DEFAULT_OVERLAP_SECONDS = 0.0
+DEFAULT_AUDIO_BITRATE = 48000
+MAX_ENCODED_BUFFER_BYTES = 4 * 1024 * 1024
 UI_PATH = pathlib.Path(__file__).resolve().parent / "web" / "index.html"
-WORKLET_PATH = pathlib.Path(__file__).resolve().parent / "web" / "audio-worklet.js"
 
 
 class SessionConfig(BaseModel):
     session_id: str
     save_sample: bool = False
     silence_detect: bool = True
-    vad_mode: int = 2
+    debug: bool = False
+    vad_mode: int = 3
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     overlap_seconds: float = DEFAULT_OVERLAP_SECONDS
-    sample_rate: int = TARGET_SAMPLE_RATE
+    mime_type: str | None = None
+    audio_bitrate: int = DEFAULT_AUDIO_BITRATE
 
 
 @dataclass
@@ -48,6 +55,7 @@ class ServerContext:
     pipe: object
     generate_kwargs: dict[str, object]
     silence_detect_default: bool
+    vad_mode_default: int
     chunk_seconds: float
     overlap_seconds: float
     verbose: bool
@@ -61,31 +69,37 @@ class Session:
     queue: asyncio.Queue[str]
     save_sample: bool
     silence_detect: bool
+    debug: bool
     audio_preprocessor: object | None
     chunk_seconds: float
     overlap_seconds: float
-    sample_rate: int
+    stream_sample_rate: int | None = None
+    mime_type: str | None = None
+    audio_bitrate: int = DEFAULT_AUDIO_BITRATE
     capture_path: pathlib.Path | None = None
     capture_writer: wave.Wave_write | None = None
+    capture_sample_rate: int | None = None
     capture_samples: int = 0
     audio_socket: WebSocket | None = None
+    encoded_buffer: bytearray = field(default_factory=bytearray)
+    decoded_sample_cursor: int = 0
+    decoded_sample_rate: int | None = None
+    received_messages: int = 0
+    decode_attempts: int = 0
+    decoded_messages: int = 0
+    model_chunks: int = 0
+    debug_messages_sent: int = 0
 
 
-def load_index_html(silence_detect_default: bool) -> str:
+def load_index_html(silence_detect_default: bool, vad_mode_default: int) -> str:
     if UI_PATH.exists():
         checked_attr = "checked" if silence_detect_default else ""
         return (
             UI_PATH.read_text(encoding="utf-8")
             .replace("__SILENCE_DETECT_DEFAULT__", checked_attr)
-            .replace("__VAD_MODE_DEFAULT__", "2")
+            .replace("__VAD_MODE_DEFAULT__", str(vad_mode_default))
         )
     return "<!doctype html><html><body><h3>UI file missing</h3></body></html>"
-
-
-def load_worklet_js() -> str:
-    if WORKLET_PATH.exists():
-        return WORKLET_PATH.read_text(encoding="utf-8")
-    return "class MissingProcessor extends AudioWorkletProcessor { process() { return true; } } registerProcessor('pcm-resample-processor', MissingProcessor);"
 
 
 def validate_chunk_config(chunk_seconds: float, overlap_seconds: float) -> None:
@@ -95,6 +109,17 @@ def validate_chunk_config(chunk_seconds: float, overlap_seconds: float) -> None:
         raise ValueError("overlap_seconds must be >= 0")
     if overlap_seconds >= chunk_seconds:
         raise ValueError("overlap_seconds must be smaller than chunk_seconds")
+
+
+def mime_type_to_av_format(mime_type: str | None) -> str | None:
+    if not mime_type:
+        return None
+    lowered = mime_type.lower()
+    if "ogg" in lowered:
+        return "ogg"
+    if "webm" in lowered:
+        return "webm"
+    return None
 
 
 def create_context(args: argparse.Namespace, start_time: float) -> ServerContext:
@@ -118,6 +143,7 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
         pipe=runtime.pipe,
         generate_kwargs=runtime.generate_kwargs,
         silence_detect_default=args.silence_detect,
+        vad_mode_default=args.vad_mode,
         chunk_seconds=args.chunk_seconds,
         overlap_seconds=args.overlap_seconds,
         verbose=args.verbose,
@@ -127,11 +153,18 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
 
 
 class AudioStreamService:
-    def __init__(self, ctx: ServerContext, index_html: str, worklet_js: str) -> None:
+    def __init__(self, ctx: ServerContext, index_html: str) -> None:
         self.ctx = ctx
         self.index_html = index_html
-        self.worklet_js = worklet_js
         self.sessions: dict[str, Session] = {}
+
+    async def _debug(self, session: Session, message: str, limit: int = 12) -> None:
+        if not session.debug:
+            return
+        if session.debug_messages_sent >= limit:
+            return
+        session.debug_messages_sent += 1
+        await session.queue.put(f"[debug] {message}")
 
     def build_app(self) -> FastAPI:
         app = FastAPI(title="Browser Mic Transcriber")
@@ -139,10 +172,6 @@ class AudioStreamService:
         @app.get("/", response_class=HTMLResponse)
         async def index() -> str:
             return self.index_html
-
-        @app.get("/audio-worklet.js")
-        async def worklet() -> Response:
-            return Response(content=self.worklet_js, media_type="application/javascript")
 
         @app.post("/session")
         async def create_session(payload: SessionConfig) -> JSONResponse:
@@ -176,8 +205,8 @@ class AudioStreamService:
             validate_chunk_config(payload.chunk_seconds, payload.overlap_seconds)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if payload.sample_rate <= 0:
-            raise HTTPException(status_code=400, detail="sample_rate must be > 0")
+        if payload.audio_bitrate <= 0:
+            raise HTTPException(status_code=400, detail="audio_bitrate must be > 0")
 
         try:
             audio_preprocessor = create_audio_preprocessor(payload.silence_detect, vad_mode=payload.vad_mode)
@@ -189,10 +218,16 @@ class AudioStreamService:
             queue=asyncio.Queue(maxsize=64),
             save_sample=payload.save_sample,
             silence_detect=payload.silence_detect,
+            debug=payload.debug,
             audio_preprocessor=audio_preprocessor,
             chunk_seconds=payload.chunk_seconds,
             overlap_seconds=payload.overlap_seconds,
-            sample_rate=payload.sample_rate,
+            mime_type=payload.mime_type,
+            audio_bitrate=payload.audio_bitrate,
+        )
+        await self._debug(
+            self.sessions[payload.session_id],
+            f"session created mime={payload.mime_type or 'unknown'} bitrate={payload.audio_bitrate} chunk={payload.chunk_seconds:.2f}s overlap={payload.overlap_seconds:.2f}s save_sample={payload.save_sample}",
         )
         return JSONResponse({"ok": True})
 
@@ -212,24 +247,44 @@ class AudioStreamService:
         await websocket.accept()
         session.audio_socket = websocket
         buffered = np.asarray([], dtype=np.float32)
-        chunk_samples = int(round(session.chunk_seconds * TARGET_SAMPLE_RATE))
-        stride_samples = chunk_samples - int(round(session.overlap_seconds * TARGET_SAMPLE_RATE))
-        if stride_samples <= 0:
-            await session.queue.put("[server error] Invalid chunk configuration.")
-            await self._cleanup_session(session)
-            return
+        await self._debug(session, "audio websocket connected")
 
         try:
             while True:
                 message = await websocket.receive()
-                audio = self._decode_audio_message(message, session.sample_rate)
-                if audio is None or audio.size == 0:
+                session.received_messages += 1
+                raw = message.get("bytes")
+                if session.received_messages <= 4:
+                    size = len(raw) if raw else 0
+                    await self._debug(session, f"received blob #{session.received_messages} bytes={size}")
+                decoded = self._decode_audio_message(session, message)
+                if decoded is None:
+                    if session.received_messages <= 4:
+                        await self._debug(session, f"blob #{session.received_messages} not decodable yet buffer={len(session.encoded_buffer)}")
                     continue
+                audio, sample_rate = decoded
+                session.decoded_messages += 1
+                if session.decoded_messages <= 4:
+                    await self._debug(
+                        session,
+                        f"decoded chunk #{session.decoded_messages} samples={audio.size} sample_rate={sample_rate} buffer_after={len(session.encoded_buffer)}",
+                    )
+                if audio.size == 0:
+                    continue
+                if session.stream_sample_rate is None:
+                    session.stream_sample_rate = sample_rate
+                elif session.stream_sample_rate != sample_rate:
+                    if buffered.size > 0:
+                        buffered = resample_audio_linear(buffered, session.stream_sample_rate, sample_rate)
+                    session.stream_sample_rate = sample_rate
 
-                out_path = self._append_capture_audio(session, audio)
-                if out_path is not None and session.capture_samples == int(audio.size):
-                    await session.queue.put(f"[server] recording WAV capture: {out_path}")
                 buffered = np.concatenate((buffered, audio))
+                chunk_samples = int(round(session.chunk_seconds * session.stream_sample_rate))
+                stride_samples = chunk_samples - int(round(session.overlap_seconds * session.stream_sample_rate))
+                if stride_samples <= 0:
+                    await session.queue.put("[server error] Invalid chunk configuration.")
+                    await self._cleanup_session(session)
+                    return
 
                 while buffered.shape[0] >= chunk_samples:
                     chunk = buffered[:chunk_samples]
@@ -237,12 +292,28 @@ class AudioStreamService:
                     if np.max(np.abs(chunk), initial=0.0) < 1e-4:
                         continue
                     try:
-                        chunk = preprocess_audio(chunk, session.audio_preprocessor, self.ctx.verbose, self.ctx.start_time)
+                        chunk = preprocess_audio(
+                            chunk,
+                            session.stream_sample_rate,
+                            session.audio_preprocessor,
+                            self.ctx.verbose,
+                            self.ctx.start_time,
+                        )
                     except Exception as exc:
                         await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")
                         continue
                     if session.silence_detect and chunk.size == 0:
+                        if session.model_chunks == 0:
+                            await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
                         continue
+                    if session.stream_sample_rate != TARGET_SAMPLE_RATE:
+                        chunk = resample_audio_linear(chunk, session.stream_sample_rate, TARGET_SAMPLE_RATE)
+                    out_path = self._append_capture_audio(session, chunk)
+                    if out_path is not None and session.capture_samples == int(chunk.size):
+                        await session.queue.put(f"[server] recording WAV capture: {out_path}")
+                    session.model_chunks += 1
+                    if session.model_chunks <= 4:
+                        await self._debug(session, f"model chunk #{session.model_chunks} samples={chunk.size} sample_rate={TARGET_SAMPLE_RATE}")
 
                     async with self.ctx.infer_lock:
                         try:
@@ -251,7 +322,7 @@ class AudioStreamService:
                             details = likely_reason_details(exc)
                             await session.queue.put(f"[server error] Live transcription failed: {details[0]}")
                             continue
-                    if text:
+                    if text and not should_suppress_transcript(text, session.audio_preprocessor):
                         await session.queue.put(text)
         except WebSocketDisconnect:
             pass
@@ -263,14 +334,61 @@ class AudioStreamService:
         finally:
             await self._cleanup_session(session)
 
-    def _decode_audio_message(self, message: dict[str, object], input_sample_rate: int) -> np.ndarray | None:
+    def _decode_audio_message(self, session: Session, message: dict[str, object]) -> tuple[np.ndarray, int] | None:
         raw = message.get("bytes")
         if not raw:
             return None
-        audio = np.frombuffer(raw, dtype=np.float32).astype(np.float32, copy=False)
-        if input_sample_rate != TARGET_SAMPLE_RATE:
-            audio = resample_audio_linear(audio, input_sample_rate, TARGET_SAMPLE_RATE)
-        return audio
+        session.decode_attempts += 1
+        session.encoded_buffer.extend(raw)
+        try:
+            decoded = self._try_decode_bytes(bytes(session.encoded_buffer), session.mime_type)
+        except av.error.InvalidDataError:
+            if len(session.encoded_buffer) > MAX_ENCODED_BUFFER_BYTES:
+                session.encoded_buffer.clear()
+                session.decoded_sample_cursor = 0
+                session.decoded_sample_rate = None
+                raise RuntimeError("Encoded audio buffer overflow; browser stream is not decodable.")
+            return None
+        if decoded is None:
+            return None
+        audio, sample_rate = decoded
+        if session.decoded_sample_rate is not None and session.decoded_sample_rate != sample_rate:
+            session.decoded_sample_cursor = 0
+        session.decoded_sample_rate = sample_rate
+        if session.decoded_sample_cursor > audio.size:
+            session.decoded_sample_cursor = 0
+        new_audio = audio[session.decoded_sample_cursor:]
+        session.decoded_sample_cursor = int(audio.size)
+        if new_audio.size == 0:
+            return None
+        return new_audio, sample_rate
+
+    def _try_decode_bytes(self, payload: bytes, mime_type: str | None) -> tuple[np.ndarray, int] | None:
+        format_hint = mime_type_to_av_format(mime_type)
+        with av.open(io.BytesIO(payload), format=format_hint) as container:
+            decoded_frames: list[np.ndarray] = []
+            sample_rate: int | None = None
+            for frame in container.decode(audio=0):
+                mono = self._decode_audio_frame(frame)
+                if mono.size == 0:
+                    continue
+                decoded_frames.append(mono)
+                sample_rate = int(frame.sample_rate)
+        if not decoded_frames or sample_rate is None:
+            return None
+        return np.concatenate(decoded_frames), sample_rate
+
+    def _decode_audio_frame(self, frame: av.AudioFrame) -> np.ndarray:
+        array = frame.to_ndarray()
+        if array.ndim == 2:
+            audio = array.mean(axis=0)
+        else:
+            audio = array
+        audio = normalize_audio_format(audio)
+        if np.issubdtype(array.dtype, np.integer):
+            max_value = max(abs(np.iinfo(array.dtype).min), np.iinfo(array.dtype).max)
+            audio = audio / float(max_value)
+        return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
 
     async def _event_stream(self, session: Session) -> object:
         while True:
@@ -292,6 +410,7 @@ class AudioStreamService:
             writer.setsampwidth(2)
             writer.setframerate(TARGET_SAMPLE_RATE)
             session.capture_writer = writer
+            session.capture_sample_rate = TARGET_SAMPLE_RATE
         return session.capture_path
 
     def _append_capture_audio(self, session: Session, audio: np.ndarray) -> pathlib.Path | None:
@@ -322,7 +441,8 @@ class AudioStreamService:
 
         saved_path = self._close_capture_writer(session)
         if saved_path is not None:
-            duration = session.capture_samples / float(TARGET_SAMPLE_RATE)
+            capture_rate = float(session.capture_sample_rate or TARGET_SAMPLE_RATE)
+            duration = session.capture_samples / capture_rate
             try:
                 session.queue.put_nowait(f"[server] saved WAV capture: {saved_path} ({duration:.2f}s)")
             except Exception:
@@ -332,7 +452,7 @@ class AudioStreamService:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve a browser page and transcribe client microphone over AudioWorklet/WebSocket.")
+    parser = argparse.ArgumentParser(description="Serve a browser page and transcribe client microphone over Opus/WebSocket.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the HTTP server (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server (default: 8000).")
     parser.add_argument("--tls-certfile", type=pathlib.Path, default=None, help="TLS certificate file (PEM).")
@@ -361,7 +481,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable noise reduction and WebRTC VAD speech gating by default; the browser checkbox can still enable it per session.",
     )
     parser.set_defaults(silence_detect=True)
-    parser.add_argument("--vad-mode", type=int, choices=[0, 1, 2, 3], default=2, help="Default WebRTC VAD aggressiveness mode for browser sessions.")
+    parser.add_argument("--vad-mode", type=int, choices=[0, 1, 2, 3], default=3, help="Default WebRTC VAD aggressiveness mode for browser sessions.")
     parser.add_argument("--chunk-seconds", type=float, default=DEFAULT_CHUNK_SECONDS, help=f"Chunk duration in seconds for server-side transcription windows (default: {DEFAULT_CHUNK_SECONDS}).")
     parser.add_argument("--overlap-seconds", type=float, default=DEFAULT_OVERLAP_SECONDS, help=f"Chunk overlap in seconds to preserve context across windows (default: {DEFAULT_OVERLAP_SECONDS}).")
     parser.add_argument("--profile", action="store_true", help="Enable py-spy profiling for this run.")
@@ -408,7 +528,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: uvicorn is not available: {exc}", file=sys.stderr)
             return 3
 
-        service = AudioStreamService(ctx=ctx, index_html=load_index_html(ctx.silence_detect_default), worklet_js=load_worklet_js())
+        service = AudioStreamService(
+            ctx=ctx,
+            index_html=load_index_html(ctx.silence_detect_default, ctx.vad_mode_default),
+        )
         scheme = "https" if args.tls_certfile is not None else "http"
         log(f"Starting server on {scheme}://{args.host}:{args.port}", args.verbose, start_time)
         uvicorn.run(

@@ -23,24 +23,26 @@
       <button id="stopBtn" class="stop" disabled>Stop</button>
       <label><input type="checkbox" id="saveSample" /> Save WAV capture</label>
       <label><input type="checkbox" id="silenceDetect" __SILENCE_DETECT_DEFAULT__ /> Voice enhance</label>
-      <label>VAD: <select id="vadMode"><option value="0">0</option><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+      <label><input type="checkbox" id="echoCancellation" /> Echo cancellation</label>
+      <label><input type="checkbox" id="noiseSuppression" /> Noise suppression</label>
+      <label><input type="checkbox" id="autoGainControl" /> Auto gain control</label>
+      <label><input type="checkbox" id="clientDebug" /> Client debug</label>
+      <label>VAD: <select id="vadMode"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option></select></label>
       <label>Chunk (s): <input id="chunkSeconds" type="number" min="0.2" step="0.1" value="1.5" style="width:72px" /></label>
-      <label>Overlap (s): <input id="overlapSeconds" type="number" min="0.0" step="0.05" value="0.25" style="width:72px" /></label>
+      <label>Overlap (s): <input id="overlapSeconds" type="number" min="0.0" step="0.05" value="0.00" style="width:72px" /></label>
       <span id="status">Idle</span>
     </div>
     <div id="out"></div>
   </div>
   <script>
-    const TARGET_SAMPLE_RATE = 16000;
+    const TARGET_AUDIO_BITRATE = 48000;
+    const CHUNK_TIMESLICE_MS = 250;
     let stream = null;
-    let source = null;
     let eventSource = null;
     let audioSocket = null;
     let sessionId = null;
-    let audioContext = null;
-    let sourceNode = null;
-    let workletNode = null;
-    let sinkNode = null;
+    let mediaRecorder = null;
+    let sentBlobCount = 0;
 
     const out = document.getElementById("out");
     const statusEl = document.getElementById("status");
@@ -48,6 +50,10 @@
     const stopBtn = document.getElementById("stopBtn");
     const saveSample = document.getElementById("saveSample");
     const silenceDetect = document.getElementById("silenceDetect");
+    const echoCancellation = document.getElementById("echoCancellation");
+    const noiseSuppression = document.getElementById("noiseSuppression");
+    const autoGainControl = document.getElementById("autoGainControl");
+    const clientDebug = document.getElementById("clientDebug");
     const vadMode = document.getElementById("vadMode");
     const chunkSeconds = document.getElementById("chunkSeconds");
     const overlapSeconds = document.getElementById("overlapSeconds");
@@ -58,19 +64,52 @@
       out.textContent += (out.textContent ? "\n" : "") + v;
       out.scrollTop = out.scrollHeight;
     }
+    function appendClientDebug(v) {
+      if (!clientDebug.checked) {
+        return;
+      }
+      appendLine(v);
+    }
 
     function wsBaseUrl() {
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
       return `${proto}://${window.location.host}`;
     }
 
+    function preferredMimeType() {
+      const candidates = [
+        "audio/ogg;codecs=opus",
+        "audio/webm;codecs=opus",
+        "audio/ogg",
+        "audio/webm",
+      ];
+      for (const candidate of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(candidate)) {
+          return candidate;
+        }
+      }
+      return "";
+    }
+
     async function start() {
       sessionId = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
       setStatus("Requesting microphone...");
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          channelCount: 1,
+          sampleRate: 48000,
+          echoCancellation: !!echoCancellation.checked,
+          noiseSuppression: !!noiseSuppression.checked,
+          autoGainControl: !!autoGainControl.checked
+        },
         video: false
       });
+      const mimeType = preferredMimeType();
+      if (!mimeType) {
+        throw new Error("No supported Opus MediaRecorder MIME type");
+      }
+      const trackSettings = stream.getAudioTracks()[0] ? stream.getAudioTracks()[0].getSettings() : {};
+      appendClientDebug(`[client] mime=${mimeType} sampleRate=${trackSettings.sampleRate || "unknown"} channelCount=${trackSettings.channelCount || "unknown"}`);
 
       const response = await fetch("/session", {
         method: "POST",
@@ -79,10 +118,12 @@
           session_id: sessionId,
           save_sample: !!saveSample.checked,
           silence_detect: !!silenceDetect.checked,
+          debug: !!clientDebug.checked,
           vad_mode: Number(vadMode.value),
           chunk_seconds: Number(chunkSeconds.value),
           overlap_seconds: Number(overlapSeconds.value),
-          sample_rate: TARGET_SAMPLE_RATE
+          mime_type: mimeType,
+          audio_bitrate: TARGET_AUDIO_BITRATE
         })
       });
       if (!response.ok) {
@@ -93,34 +134,40 @@
       eventSource.onmessage = (evt) => appendLine(evt.data);
       eventSource.onerror = () => setStatus("Event stream disconnected");
 
-      audioContext = new AudioContext();
-      await audioContext.audioWorklet.addModule("/audio-worklet.js");
-
-      sourceNode = audioContext.createMediaStreamSource(stream);
-      workletNode = new AudioWorkletNode(audioContext, "pcm-resample-processor", {
-        processorOptions: { targetSampleRate: TARGET_SAMPLE_RATE, chunkSamples: 2048 }
-      });
-      sinkNode = audioContext.createGain();
-      sinkNode.gain.value = 0;
-
       audioSocket = new WebSocket(`${wsBaseUrl()}/audio/${sessionId}`);
-      audioSocket.binaryType = "arraybuffer";
       await new Promise((resolve, reject) => {
         audioSocket.onopen = resolve;
         audioSocket.onerror = () => reject(new Error("Audio socket failed to open"));
       });
+      appendClientDebug("[client] audio websocket open");
 
-      workletNode.port.onmessage = (evt) => {
+      mediaRecorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: TARGET_AUDIO_BITRATE
+      });
+      appendClientDebug(`[client] recorder=${mediaRecorder.mimeType || mimeType} bitrate=${TARGET_AUDIO_BITRATE}`);
+      mediaRecorder.ondataavailable = async (evt) => {
+        if (!evt.data || evt.data.size === 0) {
+          if (sentBlobCount < 4) {
+            appendClientDebug("[client] empty recorder blob");
+          }
+          return;
+        }
         if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-          audioSocket.send(evt.data);
+          sentBlobCount += 1;
+          if (sentBlobCount <= 4) {
+            appendClientDebug(`[client] blob #${sentBlobCount} size=${evt.data.size}`);
+          }
+          audioSocket.send(await evt.data.arrayBuffer());
         }
       };
+      mediaRecorder.onerror = (evt) => {
+        appendClientDebug("[client error] recorder " + String(evt.error || evt.name || evt));
+      };
+      mediaRecorder.start(CHUNK_TIMESLICE_MS);
 
-      sourceNode.connect(workletNode);
-      workletNode.connect(sinkNode);
-      sinkNode.connect(audioContext.destination);
-
-      setStatus("Streaming 16 kHz mono float32 audio to server");
+      const actualRate = trackSettings.sampleRate ? `${trackSettings.sampleRate} Hz` : "native rate";
+      setStatus(`Streaming Opus (${mimeType}, ${TARGET_AUDIO_BITRATE / 1000} kbps, ${actualRate})`);
       startBtn.disabled = true;
       stopBtn.disabled = false;
     }
@@ -130,22 +177,13 @@
       startBtn.disabled = false;
       setStatus("Stopping...");
 
-      if (workletNode) {
-        try { workletNode.port.onmessage = null; } catch (_) {}
-        try { workletNode.disconnect(); } catch (_) {}
-        workletNode = null;
-      }
-      if (sinkNode) {
-        try { sinkNode.disconnect(); } catch (_) {}
-        sinkNode = null;
-      }
-      if (sourceNode) {
-        try { sourceNode.disconnect(); } catch (_) {}
-        sourceNode = null;
-      }
-      if (audioContext) {
-        try { await audioContext.close(); } catch (_) {}
-        audioContext = null;
+      if (mediaRecorder) {
+        try { mediaRecorder.ondataavailable = null; } catch (_) {}
+        try { mediaRecorder.onerror = null; } catch (_) {}
+        if (mediaRecorder.state !== "inactive") {
+          try { mediaRecorder.stop(); } catch (_) {}
+        }
+        mediaRecorder = null;
       }
       if (audioSocket) {
         try { audioSocket.close(); } catch (_) {}
@@ -162,6 +200,7 @@
       if (sessionId) {
         try { await fetch("/session/" + sessionId, { method: "DELETE" }); } catch (_) {}
       }
+      sentBlobCount = 0;
 
       setStatus("Idle");
     }
