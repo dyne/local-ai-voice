@@ -22,6 +22,7 @@
       <button id="startBtn" class="start">Start</button>
       <button id="stopBtn" class="stop" disabled>Stop</button>
       <label><input type="checkbox" id="saveSample" /> Save WAV capture</label>
+      <label><input type="checkbox" id="silenceDetect" __SILENCE_DETECT_DEFAULT__ /> Voice enhance</label>
       <label>Chunk (s): <input id="chunkSeconds" type="number" min="0.2" step="0.1" value="1.5" style="width:72px" /></label>
       <label>Overlap (s): <input id="overlapSeconds" type="number" min="0.0" step="0.05" value="0.25" style="width:72px" /></label>
       <span id="status">Idle</span>
@@ -39,6 +40,7 @@
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
     const saveSample = document.getElementById("saveSample");
+    const silenceDetect = document.getElementById("silenceDetect");
     const chunkSeconds = document.getElementById("chunkSeconds");
     const overlapSeconds = document.getElementById("overlapSeconds");
 
@@ -87,6 +89,7 @@
           type: pc.localDescription.type,
           session_id: sessionId,
           save_sample: !!saveSample.checked,
+          silence_detect: !!silenceDetect.checked,
           chunk_seconds: Number(chunkSeconds.value),
           overlap_seconds: Number(overlapSeconds.value)
         })

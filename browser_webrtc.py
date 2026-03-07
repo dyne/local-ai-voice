@@ -20,7 +20,9 @@ from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai_voice import (
     TARGET_SAMPLE_RATE,
     configure_openvino_runtime_env,
+    create_audio_preprocessor,
     log,
+    preprocess_audio,
     resample_audio_linear,
     transcribe_chunk,
 )
@@ -36,6 +38,7 @@ class Offer(BaseModel):
     type: str
     session_id: str
     save_sample: bool = False
+    silence_detect: bool = True
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     overlap_seconds: float = DEFAULT_OVERLAP_SECONDS
 
@@ -44,6 +47,7 @@ class Offer(BaseModel):
 class ServerContext:
     pipe: object
     generate_kwargs: dict[str, object]
+    silence_detect_default: bool
     chunk_seconds: float
     overlap_seconds: float
     verbose: bool
@@ -57,6 +61,8 @@ class Session:
     pc: RTCPeerConnection
     queue: asyncio.Queue[str]
     save_sample: bool
+    silence_detect: bool
+    audio_preprocessor: object | None
     chunk_seconds: float
     overlap_seconds: float
     capture_path: pathlib.Path | None = None
@@ -65,9 +71,10 @@ class Session:
     worker: asyncio.Task | None = None
 
 
-def load_index_html() -> str:
+def load_index_html(silence_detect_default: bool) -> str:
     if UI_PATH.exists():
-        return UI_PATH.read_text(encoding="utf-8")
+        checked_attr = "checked" if silence_detect_default else ""
+        return UI_PATH.read_text(encoding="utf-8").replace("__SILENCE_DETECT_DEFAULT__", checked_attr)
     return "<!doctype html><html><body><h3>UI file missing</h3></body></html>"
 
 
@@ -158,6 +165,7 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
     return ServerContext(
         pipe=runtime.pipe,
         generate_kwargs=runtime.generate_kwargs,
+        silence_detect_default=args.silence_detect,
         chunk_seconds=args.chunk_seconds,
         overlap_seconds=args.overlap_seconds,
         verbose=args.verbose,
@@ -213,9 +221,15 @@ class WebRTCService:
             pc=RTCPeerConnection(),
             queue=asyncio.Queue(maxsize=64),
             save_sample=payload.save_sample,
+            silence_detect=payload.silence_detect,
+            audio_preprocessor=None,
             chunk_seconds=payload.chunk_seconds,
             overlap_seconds=payload.overlap_seconds,
         )
+        try:
+            session.audio_preprocessor = create_audio_preprocessor(payload.silence_detect)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}") from exc
         self.sessions[payload.session_id] = session
         self._register_peer_handlers(session)
 
@@ -342,6 +356,13 @@ class WebRTCService:
                 buffered = buffered[stride_samples:]
                 if np.max(np.abs(chunk), initial=0.0) < 1e-4:
                     continue
+                try:
+                    chunk = preprocess_audio(chunk, session.audio_preprocessor, self.ctx.verbose, self.ctx.start_time)
+                except Exception as exc:
+                    await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")
+                    continue
+                if session.silence_detect and chunk.size == 0:
+                    continue
 
                 async with self.ctx.infer_lock:
                     try:
@@ -354,7 +375,7 @@ class WebRTCService:
                     await session.queue.put(text)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve a browser page and transcribe client microphone over WebRTC.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the HTTP server (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server (default: 8000).")
@@ -374,6 +395,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default=None, help="Optional language token like <|en|>.")
     parser.add_argument("--task", default=None, choices=["transcribe", "translate"], help="Optional Whisper task.")
     parser.add_argument("--timestamps", action="store_true", help="Request timestamps in result object.")
+    silence_group = parser.add_mutually_exclusive_group()
+    silence_group.add_argument(
+        "--silence-detect",
+        dest="silence_detect",
+        action="store_true",
+        help="Enable noise reduction and WebRTC VAD speech gating for browser sessions by default.",
+    )
+    silence_group.add_argument(
+        "--no-silence-detect",
+        dest="silence_detect",
+        action="store_false",
+        help="Disable noise reduction and WebRTC VAD speech gating by default; the browser checkbox can still enable it per session.",
+    )
+    parser.set_defaults(silence_detect=True)
     parser.add_argument(
         "--chunk-seconds",
         type=float,
@@ -394,7 +429,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional py-spy output SVG path (default: profiles/<timestamp>.svg).",
     )
     parser.add_argument("--verbose", action="store_true", help="Print progress logs to stderr.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_tls_args(args: argparse.Namespace) -> None:
@@ -406,9 +441,9 @@ def validate_tls_args(args: argparse.Namespace) -> None:
         raise ValueError(f"TLS key file not found: {args.tls_keyfile}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     enable_loopback_only_network()
-    args = parse_args()
+    args = parse_args(argv)
     profile_session = start_py_spy_profile(
         enabled=args.profile,
         label="local-ai-voice-webrtc",
@@ -435,7 +470,7 @@ def main() -> int:
             print(f"Error: uvicorn is not available: {exc}", file=sys.stderr)
             return 3
 
-        service = WebRTCService(ctx=ctx, index_html=load_index_html())
+        service = WebRTCService(ctx=ctx, index_html=load_index_html(ctx.silence_detect_default))
         scheme = "https" if args.tls_certfile is not None else "http"
         log(f"Starting server on {scheme}://{args.host}:{args.port}", args.verbose, start_time)
         uvicorn.run(

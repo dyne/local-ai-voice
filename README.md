@@ -12,10 +12,76 @@ The focus is on privacy, autonomy, and predictable behaviour: your audio never
 leaves the machine, models are locally managed, and the software can be
 integrated into scripts, editors, or command line workflows.
 
+# Usage
+
+## Python Version
+
+Use Python `3.11`. The Makefile defaults to `py -3.11`, and the audio
+dependencies in this repo are expected to be installed against that
+interpreter.
+
+## Install dependencies
+
+```sh
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+make install
+```
+
+## Run local transcription
+
+Transcribe a WAV file:
+
+```sh
+py -3.11 ./local-ai-voice.py input.wav --model ./whisper-tiny-fp16-ov
+```
+
+Run live microphone transcription:
+
+```sh
+py -3.11 ./local-ai-voice.py --model ./whisper-tiny-fp16-ov --chunk-seconds 1.0
+```
+
+Noise reduction and WebRTC VAD speech gating are enabled by default. Disable them with:
+
+```sh
+py -3.11 ./local-ai-voice.py --no-silence-detect --model ./whisper-tiny-fp16-ov input.wav
+```
+
+## Run browser WebRTC transcription
+
+Start the local WebRTC server:
+
+```sh
+make run-web
+```
+
+Equivalent direct command:
+
+```sh
+py -3.11 ./local-ai-voice.py web --model ./whisper-tiny-fp16-ov
+```
+
+The browser UI exposes a `Voice enhance` checkbox so noise reduction and VAD
+gating can be switched on or off per session.
+
+## Build standalone executable
+
+Build the unified executable:
+
+```sh
+make build
+```
+
+The resulting binary supports both modes:
+
+```sh
+.\dist\local-ai-voice.exe input.wav --model .\whisper-tiny-fp16-ov
+.\dist\local-ai-voice.exe web --model .\whisper-tiny-fp16-ov
+```
+
 # License
 
 Local-AI-voice is Copyright (C) 2026 by the Dyne.org Foundation
 
 It is distributed under the Affero GNU General Public License v3
-
-

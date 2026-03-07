@@ -4,6 +4,9 @@
 Applies to the single script:
 - `local-ai-voice.py`
 
+## Environment
+- Use Python `3.11` for install, validation, profiling, and packaging commands.
+
 ## Script Intent
 - Transcribe WAV files or microphone audio using OpenVINO GenAI Whisper.
 - Supports device preference via `--device` (`NPU`, `GPU`, `CPU`) and optional device enumeration via `--device list`.
@@ -26,23 +29,23 @@ Applies to the single script:
 - `--profile-output` optionally sets output SVG path (default under `profiles/`).
 
 # Validation Checklist
-1. `python -m py_compile local-ai-voice.py`
+1. `py -3.11 -m py_compile local-ai-voice.py`
 2. File transcription smoke test:
-   - `python .\local-ai-voice.py <wav> --model <model_dir>`
+   - `py -3.11 .\local-ai-voice.py <wav> --model <model_dir>`
 3. Live transcription startup test:
-   - `python .\local-ai-voice.py --model <model_dir> --chunk-seconds 1.0`
+   - `py -3.11 .\local-ai-voice.py --model <model_dir> --chunk-seconds 1.0`
 4. Run one device-path check when adjusting device selection:
-   - `python .\local-ai-voice.py --device CPU --model <cpu_model_dir>`
+   - `py -3.11 .\local-ai-voice.py --device CPU --model <cpu_model_dir>`
 
 ## Profiling
 - Install profiler:
-  - `python -m pip install py-spy`
+  - `py -3.11 -m pip install py-spy`
 - Profile file mode:
-  - `python .\local-ai-voice.py <wav> --model <model_dir> --profile`
+  - `py -3.11 .\local-ai-voice.py <wav> --model <model_dir> --profile`
 - Profile live mode:
-  - `python .\local-ai-voice.py --model <model_dir> --chunk-seconds 1.0 --profile`
+  - `py -3.11 .\local-ai-voice.py --model <model_dir> --chunk-seconds 1.0 --profile`
 - Profile WebRTC server:
-  - `python .\browser_webrtc.py --model <model_dir> --profile`
+  - `py -3.11 .\browser_webrtc.py --model <model_dir> --profile`
 - Custom output path:
   - `--profile-output .\profiles\my_run.svg`
 - Open the generated SVG in a browser and focus on hottest stacks first.
