@@ -23,6 +23,7 @@
       <button id="stopBtn" class="stop" disabled>Stop</button>
       <label><input type="checkbox" id="saveSample" /> Save WAV capture</label>
       <label><input type="checkbox" id="silenceDetect" __SILENCE_DETECT_DEFAULT__ /> Voice enhance</label>
+      <label>VAD: <select id="vadMode"><option value="0">0</option><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
       <label>Chunk (s): <input id="chunkSeconds" type="number" min="0.2" step="0.1" value="1.5" style="width:72px" /></label>
       <label>Overlap (s): <input id="overlapSeconds" type="number" min="0.0" step="0.05" value="0.25" style="width:72px" /></label>
       <span id="status">Idle</span>
@@ -47,8 +48,10 @@
     const stopBtn = document.getElementById("stopBtn");
     const saveSample = document.getElementById("saveSample");
     const silenceDetect = document.getElementById("silenceDetect");
+    const vadMode = document.getElementById("vadMode");
     const chunkSeconds = document.getElementById("chunkSeconds");
     const overlapSeconds = document.getElementById("overlapSeconds");
+    vadMode.value = "__VAD_MODE_DEFAULT__";
 
     function setStatus(v) { statusEl.textContent = v; }
     function appendLine(v) {
@@ -76,6 +79,7 @@
           session_id: sessionId,
           save_sample: !!saveSample.checked,
           silence_detect: !!silenceDetect.checked,
+          vad_mode: Number(vadMode.value),
           chunk_seconds: Number(chunkSeconds.value),
           overlap_seconds: Number(overlapSeconds.value),
           sample_rate: TARGET_SAMPLE_RATE

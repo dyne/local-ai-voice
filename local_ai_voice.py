@@ -5,6 +5,7 @@ import pathlib
 import sys
 import time
 import wave
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -19,8 +20,24 @@ from voice_runtime import (
 
 TARGET_SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
-VAD_MODE = 1
+VAD_MODE = 2
+VAD_MIN_SPEECH_FRAMES = 3
+VAD_MIN_SPEECH_RATIO = 0.2
+VAD_MIN_UTTERANCE_MS = 180
+VAD_HANGOVER_MS = 300
 NR_IMPORT_ERROR = "Install noisereduce and webrtcvad-wheels."
+
+
+@dataclass
+class AudioPreprocessor:
+    nr: object
+    vad: object
+    vad_mode: int
+    min_speech_frames: int
+    min_speech_ratio: float
+    min_utterance_ms: int
+    hangover_ms: int
+    hangover_frames: int = 0
 
 
 def log(message: str, verbose: bool, start_time: float | None = None) -> None:
@@ -91,30 +108,98 @@ def ensure_sample_rate(audio: np.ndarray, sample_rate: int, verbose: bool, start
     return resample_audio_linear(audio, sample_rate, TARGET_SAMPLE_RATE), TARGET_SAMPLE_RATE
 
 
-def create_audio_preprocessor(enabled: bool) -> object | None:
+def create_audio_preprocessor(
+    enabled: bool,
+    *,
+    vad_mode: int = VAD_MODE,
+    min_speech_frames: int = VAD_MIN_SPEECH_FRAMES,
+    min_speech_ratio: float = VAD_MIN_SPEECH_RATIO,
+    min_utterance_ms: int = VAD_MIN_UTTERANCE_MS,
+    hangover_ms: int = VAD_HANGOVER_MS,
+) -> object | None:
     if not enabled:
         return None
+    if vad_mode not in (0, 1, 2, 3):
+        raise RuntimeError(f"Invalid VAD mode: {vad_mode}. Use 0, 1, 2, or 3.")
+    if min_speech_frames <= 0:
+        raise RuntimeError("min_speech_frames must be > 0.")
+    if not (0.0 < min_speech_ratio <= 1.0):
+        raise RuntimeError("min_speech_ratio must be > 0 and <= 1.")
+    if min_utterance_ms <= 0:
+        raise RuntimeError("min_utterance_ms must be > 0.")
+    if hangover_ms < 0:
+        raise RuntimeError("hangover_ms must be >= 0.")
     try:
         import noisereduce as nr
         import webrtcvad
     except Exception as exc:
         raise RuntimeError("Failed to import audio preprocessing dependencies.") from exc
-    return nr, webrtcvad.Vad(VAD_MODE)
+    return AudioPreprocessor(
+        nr=nr,
+        vad=webrtcvad.Vad(vad_mode),
+        vad_mode=vad_mode,
+        min_speech_frames=min_speech_frames,
+        min_speech_ratio=min_speech_ratio,
+        min_utterance_ms=min_utterance_ms,
+        hangover_ms=hangover_ms,
+    )
 
 
-def contains_speech(audio: np.ndarray, vad: object) -> bool:
+def speech_frame_stats(audio: np.ndarray, vad: object) -> tuple[int, int, int]:
     frame_samples = TARGET_SAMPLE_RATE * VAD_FRAME_MS // 1000
     pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
     if pcm16.size == 0:
-        return False
+        return 0, 0, 0
+    speech_frames = 0
+    max_consecutive = 0
+    consecutive = 0
+    total_frames = 0
     for start_idx in range(0, pcm16.shape[0], frame_samples):
         frame = pcm16[start_idx:start_idx + frame_samples]
         if frame.size == 0:
             continue
         if frame.size < frame_samples:
             frame = np.pad(frame, (0, frame_samples - frame.size))
+        total_frames += 1
         if vad.is_speech(frame.tobytes(), TARGET_SAMPLE_RATE):
-            return True
+            speech_frames += 1
+            consecutive += 1
+            if consecutive > max_consecutive:
+                max_consecutive = consecutive
+        else:
+            consecutive = 0
+    return speech_frames, total_frames, max_consecutive
+
+
+def _speech_detected(
+    original_audio: np.ndarray,
+    reduced_audio: np.ndarray,
+    preprocessor: AudioPreprocessor,
+) -> bool:
+    min_duration_frames = max(1, int(np.ceil(preprocessor.min_utterance_ms / float(VAD_FRAME_MS))))
+    hangover_frames = max(1, int(np.ceil(preprocessor.hangover_ms / float(VAD_FRAME_MS))))
+
+    orig_speech, orig_total, orig_run = speech_frame_stats(original_audio, preprocessor.vad)
+    red_speech, red_total, red_run = speech_frame_stats(reduced_audio, preprocessor.vad)
+    total_frames = max(orig_total, red_total)
+    if total_frames == 0:
+        preprocessor.hangover_frames = 0
+        return False
+
+    speech_frames = max(orig_speech, red_speech)
+    speech_ratio = speech_frames / float(total_frames)
+    consecutive_run = max(orig_run, red_run)
+    speech_now = (
+        consecutive_run >= preprocessor.min_speech_frames
+        and speech_frames >= min_duration_frames
+        and speech_ratio >= preprocessor.min_speech_ratio
+    )
+    if speech_now:
+        preprocessor.hangover_frames = hangover_frames
+        return True
+    if preprocessor.hangover_frames > 0:
+        preprocessor.hangover_frames -= min(total_frames, preprocessor.hangover_frames)
+        return True
     return False
 
 
@@ -126,16 +211,16 @@ def preprocess_audio(
 ) -> np.ndarray:
     if preprocessor is None:
         return np.asarray(audio, dtype=np.float32, copy=False)
-    nr, vad = preprocessor
+    original_audio = np.asarray(audio, dtype=np.float32, copy=False)
     try:
-        reduced = nr.reduce_noise(y=np.asarray(audio, dtype=np.float32, copy=False), sr=TARGET_SAMPLE_RATE)
+        reduced = preprocessor.nr.reduce_noise(y=original_audio, sr=TARGET_SAMPLE_RATE)
     except Exception as exc:
         raise RuntimeError("Noise reduction failed.") from exc
 
     reduced_audio = np.asarray(reduced, dtype=np.float32).reshape(-1)
     if reduced_audio.size == 0:
         return reduced_audio
-    if not contains_speech(reduced_audio, vad):
+    if not _speech_detected(original_audio, reduced_audio, preprocessor):
         log("Audio skipped: no speech detected by VAD", verbose, start)
         return np.asarray([], dtype=np.float32)
     return reduced_audio
@@ -366,6 +451,11 @@ def parse_transcribe_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable noise reduction and WebRTC VAD speech gating.",
     )
     parser.set_defaults(silence_detect=True)
+    parser.add_argument("--vad-mode", type=int, choices=[0, 1, 2, 3], default=VAD_MODE, help=f"WebRTC VAD aggressiveness mode (default: {VAD_MODE}).")
+    parser.add_argument("--vad-min-speech-frames", type=int, default=VAD_MIN_SPEECH_FRAMES, help=f"Minimum consecutive speech frames required to trigger speech (default: {VAD_MIN_SPEECH_FRAMES}).")
+    parser.add_argument("--vad-min-speech-ratio", type=float, default=VAD_MIN_SPEECH_RATIO, help=f"Minimum speech frame ratio per chunk (default: {VAD_MIN_SPEECH_RATIO}).")
+    parser.add_argument("--vad-min-utterance-ms", type=int, default=VAD_MIN_UTTERANCE_MS, help=f"Minimum detected speech duration in milliseconds (default: {VAD_MIN_UTTERANCE_MS}).")
+    parser.add_argument("--vad-hangover-ms", type=int, default=VAD_HANGOVER_MS, help=f"Hangover duration in milliseconds after speech ends (default: {VAD_HANGOVER_MS}).")
     parser.add_argument(
         "--chunk-seconds",
         type=float,
@@ -414,7 +504,14 @@ def run_transcribe(argv: list[str] | None = None) -> int:
 
         pipe = runtime.pipe
         try:
-            audio_preprocessor = create_audio_preprocessor(args.silence_detect)
+            audio_preprocessor = create_audio_preprocessor(
+                args.silence_detect,
+                vad_mode=args.vad_mode,
+                min_speech_frames=args.vad_min_speech_frames,
+                min_speech_ratio=args.vad_min_speech_ratio,
+                min_utterance_ms=args.vad_min_utterance_ms,
+                hangover_ms=args.vad_hangover_ms,
+            )
         except Exception as exc:
             return fail("Audio preprocessing failed.", [f"Runtime error: {exc}", NR_IMPORT_ERROR], exit_code=6)
         generate_kwargs = runtime.generate_kwargs

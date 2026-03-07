@@ -37,6 +37,7 @@ class SessionConfig(BaseModel):
     session_id: str
     save_sample: bool = False
     silence_detect: bool = True
+    vad_mode: int = 2
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     overlap_seconds: float = DEFAULT_OVERLAP_SECONDS
     sample_rate: int = TARGET_SAMPLE_RATE
@@ -73,7 +74,11 @@ class Session:
 def load_index_html(silence_detect_default: bool) -> str:
     if UI_PATH.exists():
         checked_attr = "checked" if silence_detect_default else ""
-        return UI_PATH.read_text(encoding="utf-8").replace("__SILENCE_DETECT_DEFAULT__", checked_attr)
+        return (
+            UI_PATH.read_text(encoding="utf-8")
+            .replace("__SILENCE_DETECT_DEFAULT__", checked_attr)
+            .replace("__VAD_MODE_DEFAULT__", "2")
+        )
     return "<!doctype html><html><body><h3>UI file missing</h3></body></html>"
 
 
@@ -175,7 +180,7 @@ class AudioStreamService:
             raise HTTPException(status_code=400, detail="sample_rate must be > 0")
 
         try:
-            audio_preprocessor = create_audio_preprocessor(payload.silence_detect)
+            audio_preprocessor = create_audio_preprocessor(payload.silence_detect, vad_mode=payload.vad_mode)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}") from exc
 
@@ -356,6 +361,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable noise reduction and WebRTC VAD speech gating by default; the browser checkbox can still enable it per session.",
     )
     parser.set_defaults(silence_detect=True)
+    parser.add_argument("--vad-mode", type=int, choices=[0, 1, 2, 3], default=2, help="Default WebRTC VAD aggressiveness mode for browser sessions.")
     parser.add_argument("--chunk-seconds", type=float, default=DEFAULT_CHUNK_SECONDS, help=f"Chunk duration in seconds for server-side transcription windows (default: {DEFAULT_CHUNK_SECONDS}).")
     parser.add_argument("--overlap-seconds", type=float, default=DEFAULT_OVERLAP_SECONDS, help=f"Chunk overlap in seconds to preserve context across windows (default: {DEFAULT_OVERLAP_SECONDS}).")
     parser.add_argument("--profile", action="store_true", help="Enable py-spy profiling for this run.")
