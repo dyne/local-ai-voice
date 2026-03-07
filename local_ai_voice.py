@@ -498,10 +498,16 @@ def run_live_mode(
         )
 
 
-def parse_transcribe_args(argv: list[str] | None = None) -> argparse.Namespace:
+def build_transcribe_parser(*, include_web_flag: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Transcribe with OpenVINO GenAI Whisper on NPU/GPU/CPU (file or live microphone mode)."
     )
+    if include_web_flag:
+        parser.add_argument(
+            "--web",
+            action="store_true",
+            help="Run the browser audio streaming transcription server instead of file/live transcription.",
+        )
     parser.add_argument("wav_path", type=pathlib.Path, nargs="?", help="Optional input .wav path.")
     parser.add_argument(
         "--device",
@@ -550,6 +556,11 @@ def parse_transcribe_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional py-spy output SVG path (default: profiles/<timestamp>.svg).",
     )
     parser.add_argument("--verbose", action="store_true", help="Print progress logs to stderr.")
+    return parser
+
+
+def parse_transcribe_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_transcribe_parser()
     return parser.parse_args(argv)
 
 
@@ -610,20 +621,22 @@ def run_transcribe(argv: list[str] | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     enable_loopback_only_network()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if not raw_argv or raw_argv[0] not in {"transcribe", "web"}:
-        raw_argv.insert(0, "transcribe")
+    if any(arg in {"-h", "--help"} for arg in raw_argv) and "--web" not in raw_argv:
+        build_transcribe_parser(include_web_flag=True).parse_args(raw_argv)
+        return 0
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Run the browser audio streaming transcription server instead of file/live transcription.",
+    )
+    args, remaining = parser.parse_known_args(raw_argv)
 
-    parser = argparse.ArgumentParser(description="Local Whisper transcription and WebRTC server.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("transcribe", help="Run file or live microphone transcription.")
-    subparsers.add_parser("web", help="Run the browser audio streaming transcription server.")
-    args = parser.parse_args(raw_argv[:1])
-
-    if args.command == "web":
+    if args.web:
         import browser_webrtc
 
-        return browser_webrtc.main(raw_argv[1:])
-    return run_transcribe(raw_argv[1:])
+        return browser_webrtc.main(remaining)
+    return run_transcribe(remaining)
 
 
 if __name__ == "__main__":

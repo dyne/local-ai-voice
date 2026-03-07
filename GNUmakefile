@@ -45,7 +45,7 @@ run:
 	$(PYTHON) $(SCRIPT)
 
 run-web:
-	$(PYTHON) $(SCRIPT) web
+	$(PYTHON) $(SCRIPT) --web
 
 clean:
 	$(RM) -r build dist __pycache__ *.spec
