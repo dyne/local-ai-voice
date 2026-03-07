@@ -30,10 +30,16 @@
     <div id="out"></div>
   </div>
   <script>
-    let pc = null;
+    const TARGET_SAMPLE_RATE = 16000;
     let stream = null;
     let source = null;
+    let eventSource = null;
+    let audioSocket = null;
     let sessionId = null;
+    let audioContext = null;
+    let sourceNode = null;
+    let workletNode = null;
+    let sinkNode = null;
 
     const out = document.getElementById("out");
     const statusEl = document.getElementById("status");
@@ -50,17 +56,9 @@
       out.scrollTop = out.scrollHeight;
     }
 
-    function waitIceGathering(pc) {
-      if (pc.iceGatheringState === "complete") return Promise.resolve();
-      return new Promise((resolve) => {
-        const check = () => {
-          if (pc.iceGatheringState === "complete") {
-            pc.removeEventListener("icegatheringstatechange", check);
-            resolve();
-          }
-        };
-        pc.addEventListener("icegatheringstatechange", check);
-      });
+    function wsBaseUrl() {
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${window.location.host}`;
     }
 
     async function start() {
@@ -71,41 +69,54 @@
         video: false
       });
 
-      pc = new RTCPeerConnection();
-      pc.onconnectionstatechange = () => setStatus("WebRTC: " + pc.connectionState);
-      for (const track of stream.getTracks()) {
-        pc.addTrack(track, stream);
-      }
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await waitIceGathering(pc);
-
-      const response = await fetch("/offer", {
+      const response = await fetch("/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sdp: pc.localDescription.sdp,
-          type: pc.localDescription.type,
           session_id: sessionId,
           save_sample: !!saveSample.checked,
           silence_detect: !!silenceDetect.checked,
           chunk_seconds: Number(chunkSeconds.value),
-          overlap_seconds: Number(overlapSeconds.value)
+          overlap_seconds: Number(overlapSeconds.value),
+          sample_rate: TARGET_SAMPLE_RATE
         })
       });
       if (!response.ok) {
-        const txt = await response.text();
-        throw new Error("Offer failed: " + txt);
+        throw new Error("Session setup failed: " + await response.text());
       }
-      const answer = await response.json();
-      await pc.setRemoteDescription(answer);
 
-      source = new EventSource("/events/" + sessionId);
-      source.onmessage = (evt) => appendLine(evt.data);
-      source.onerror = () => setStatus("Event stream disconnected");
+      eventSource = new EventSource("/events/" + sessionId);
+      eventSource.onmessage = (evt) => appendLine(evt.data);
+      eventSource.onerror = () => setStatus("Event stream disconnected");
 
-      setStatus("Streaming microphone to server");
+      audioContext = new AudioContext();
+      await audioContext.audioWorklet.addModule("/audio-worklet.js");
+
+      sourceNode = audioContext.createMediaStreamSource(stream);
+      workletNode = new AudioWorkletNode(audioContext, "pcm-resample-processor", {
+        processorOptions: { targetSampleRate: TARGET_SAMPLE_RATE, chunkSamples: 2048 }
+      });
+      sinkNode = audioContext.createGain();
+      sinkNode.gain.value = 0;
+
+      audioSocket = new WebSocket(`${wsBaseUrl()}/audio/${sessionId}`);
+      audioSocket.binaryType = "arraybuffer";
+      await new Promise((resolve, reject) => {
+        audioSocket.onopen = resolve;
+        audioSocket.onerror = () => reject(new Error("Audio socket failed to open"));
+      });
+
+      workletNode.port.onmessage = (evt) => {
+        if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+          audioSocket.send(evt.data);
+        }
+      };
+
+      sourceNode.connect(workletNode);
+      workletNode.connect(sinkNode);
+      sinkNode.connect(audioContext.destination);
+
+      setStatus("Streaming 16 kHz mono float32 audio to server");
       startBtn.disabled = true;
       stopBtn.disabled = false;
     }
@@ -114,14 +125,31 @@
       stopBtn.disabled = true;
       startBtn.disabled = false;
       setStatus("Stopping...");
-      if (source) {
-        source.close();
-        source = null;
+
+      if (workletNode) {
+        try { workletNode.port.onmessage = null; } catch (_) {}
+        try { workletNode.disconnect(); } catch (_) {}
+        workletNode = null;
       }
-      if (pc) {
-        pc.getSenders().forEach((s) => s.track && s.track.stop());
-        pc.close();
-        pc = null;
+      if (sinkNode) {
+        try { sinkNode.disconnect(); } catch (_) {}
+        sinkNode = null;
+      }
+      if (sourceNode) {
+        try { sourceNode.disconnect(); } catch (_) {}
+        sourceNode = null;
+      }
+      if (audioContext) {
+        try { await audioContext.close(); } catch (_) {}
+        audioContext = null;
+      }
+      if (audioSocket) {
+        try { audioSocket.close(); } catch (_) {}
+        audioSocket = null;
+      }
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
       }
       if (stream) {
         stream.getTracks().forEach((t) => t.stop());
@@ -130,6 +158,7 @@
       if (sessionId) {
         try { await fetch("/session/" + sessionId, { method: "DELETE" }); } catch (_) {}
       }
+
       setStatus("Idle");
     }
 

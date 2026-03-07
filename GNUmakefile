@@ -5,7 +5,7 @@ PIP := $(PYTHON) -m pip
 SCRIPT := local-ai-voice.py
 APP_NAME := local-ai-voice
 SPEC := $(APP_NAME).spec
-REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn aiortc av pydantic
+REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic
 OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
 
 .PHONY: all install install-build spec build build-webrtc run run-web clean
@@ -32,9 +32,8 @@ spec: install-build
 		--collect-data openvino_genai \
 		--collect-binaries openvino_tokenizers \
 		--collect-data openvino_tokenizers \
-		--collect-binaries av \
-		--collect-data aiortc \
 		--add-data "web/index.html;web" \
+		--add-data "web/audio-worklet.js;web" \
 		$(SCRIPT)
 
 build: install spec

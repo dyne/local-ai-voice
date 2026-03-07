@@ -20,6 +20,9 @@ Use Python `3.11`. The Makefile defaults to `py -3.11`, and the audio
 dependencies in this repo are expected to be installed against that
 interpreter.
 
+Browser streaming requires a WebSocket backend for `uvicorn`; the repo installs
+`websockets` for that.
+
 ## Install dependencies
 
 ```sh
@@ -42,15 +45,15 @@ Run live microphone transcription:
 py -3.11 ./local-ai-voice.py --model ./whisper-tiny-fp16-ov --chunk-seconds 1.0
 ```
 
-Noise reduction and WebRTC VAD speech gating are enabled by default. Disable them with:
+Noise reduction and VAD speech gating are enabled by default. Disable them with:
 
 ```sh
 py -3.11 ./local-ai-voice.py --no-silence-detect --model ./whisper-tiny-fp16-ov input.wav
 ```
 
-## Run browser WebRTC transcription
+## Run browser transcription
 
-Start the local WebRTC server:
+Start the local browser transcription server:
 
 ```sh
 make run-web
@@ -62,8 +65,10 @@ Equivalent direct command:
 py -3.11 ./local-ai-voice.py web --model ./whisper-tiny-fp16-ov
 ```
 
-The browser UI exposes a `Voice enhance` checkbox so noise reduction and VAD
-gating can be switched on or off per session.
+The browser UI uses an `AudioWorklet` to downmix microphone input to mono,
+resample it to `16 kHz`, and stream float32 PCM to the local server over a
+WebSocket connection. The `Voice enhance` checkbox controls noise reduction and
+VAD gating per session.
 
 ## Build standalone executable
 

@@ -10,9 +10,8 @@ import wave
 from dataclasses import dataclass
 
 import numpy as np
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from network_guard import enable_loopback_only_network
@@ -31,16 +30,16 @@ from voice_runtime import DeviceListRequested, PipelineSetupError, create_whispe
 DEFAULT_CHUNK_SECONDS = 1.5
 DEFAULT_OVERLAP_SECONDS = 0.25
 UI_PATH = pathlib.Path(__file__).resolve().parent / "web" / "index.html"
+WORKLET_PATH = pathlib.Path(__file__).resolve().parent / "web" / "audio-worklet.js"
 
 
-class Offer(BaseModel):
-    sdp: str
-    type: str
+class SessionConfig(BaseModel):
     session_id: str
     save_sample: bool = False
     silence_detect: bool = True
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS
     overlap_seconds: float = DEFAULT_OVERLAP_SECONDS
+    sample_rate: int = TARGET_SAMPLE_RATE
 
 
 @dataclass
@@ -58,17 +57,17 @@ class ServerContext:
 @dataclass
 class Session:
     session_id: str
-    pc: RTCPeerConnection
     queue: asyncio.Queue[str]
     save_sample: bool
     silence_detect: bool
     audio_preprocessor: object | None
     chunk_seconds: float
     overlap_seconds: float
+    sample_rate: int
     capture_path: pathlib.Path | None = None
     capture_writer: wave.Wave_write | None = None
     capture_samples: int = 0
-    worker: asyncio.Task | None = None
+    audio_socket: WebSocket | None = None
 
 
 def load_index_html(silence_detect_default: bool) -> str:
@@ -78,6 +77,12 @@ def load_index_html(silence_detect_default: bool) -> str:
     return "<!doctype html><html><body><h3>UI file missing</h3></body></html>"
 
 
+def load_worklet_js() -> str:
+    if WORKLET_PATH.exists():
+        return WORKLET_PATH.read_text(encoding="utf-8")
+    return "class MissingProcessor extends AudioWorkletProcessor { process() { return true; } } registerProcessor('pcm-resample-processor', MissingProcessor);"
+
+
 def validate_chunk_config(chunk_seconds: float, overlap_seconds: float) -> None:
     if chunk_seconds <= 0:
         raise ValueError("chunk_seconds must be > 0")
@@ -85,64 +90,6 @@ def validate_chunk_config(chunk_seconds: float, overlap_seconds: float) -> None:
         raise ValueError("overlap_seconds must be >= 0")
     if overlap_seconds >= chunk_seconds:
         raise ValueError("overlap_seconds must be smaller than chunk_seconds")
-
-
-def audio_frame_to_float32_mono(frame: object) -> np.ndarray:
-    arr = frame.to_ndarray()
-    fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
-
-    if np.issubdtype(arr.dtype, np.unsignedinteger):
-        info = np.iinfo(arr.dtype)
-        center = float((info.max + 1) // 2)
-        data = (arr.astype(np.float32) - center) / center
-    elif np.issubdtype(arr.dtype, np.signedinteger):
-        if fmt_name in {"s16", "s16p"}:
-            denom = 32768.0
-        elif fmt_name in {"s32", "s32p"}:
-            peak = float(np.max(np.abs(arr), initial=0))
-            denom = 32768.0 if peak <= 65536.0 else 2147483648.0
-        else:
-            info = np.iinfo(arr.dtype)
-            denom = float(max(abs(info.min), info.max))
-        data = arr.astype(np.float32) / denom
-    else:
-        data = arr.astype(np.float32)
-
-    if data.ndim == 1:
-        mono = data
-    elif data.ndim == 2:
-        mono = data.mean(axis=0) if data.shape[0] <= data.shape[1] else data.mean(axis=1)
-    else:
-        mono = data.reshape(-1)
-    return np.asarray(mono, dtype=np.float32)
-
-
-def frame_to_target_audio(frame: object, resampler: object | None) -> list[np.ndarray]:
-    if resampler is None:
-        sample_rate = int(getattr(frame, "sample_rate", TARGET_SAMPLE_RATE))
-        audio = audio_frame_to_float32_mono(frame)
-        if sample_rate > 0 and sample_rate != TARGET_SAMPLE_RATE:
-            audio = resample_audio_linear(audio, sample_rate, TARGET_SAMPLE_RATE)
-        return [audio] if audio.size else []
-
-    out_frames = resampler.resample(frame)
-    if out_frames is None:
-        return []
-    if not isinstance(out_frames, list):
-        out_frames = [out_frames]
-
-    chunks: list[np.ndarray] = []
-    for out in out_frames:
-        arr = out.to_ndarray()
-        if arr.ndim == 1:
-            audio = np.asarray(arr, dtype=np.float32)
-        elif arr.ndim == 2:
-            audio = np.asarray(arr[0], dtype=np.float32) if arr.shape[0] == 1 else np.asarray(arr.mean(axis=0), dtype=np.float32)
-        else:
-            audio = np.asarray(arr.reshape(-1), dtype=np.float32)
-        if audio.size:
-            chunks.append(audio)
-    return chunks
 
 
 def create_context(args: argparse.Namespace, start_time: float) -> ServerContext:
@@ -174,10 +121,11 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
     )
 
 
-class WebRTCService:
-    def __init__(self, ctx: ServerContext, index_html: str) -> None:
+class AudioStreamService:
+    def __init__(self, ctx: ServerContext, index_html: str, worklet_js: str) -> None:
         self.ctx = ctx
         self.index_html = index_html
+        self.worklet_js = worklet_js
         self.sessions: dict[str, Session] = {}
 
     def build_app(self) -> FastAPI:
@@ -187,9 +135,17 @@ class WebRTCService:
         async def index() -> str:
             return self.index_html
 
-        @app.post("/offer")
-        async def offer(payload: Offer) -> JSONResponse:
-            return await self._handle_offer(payload)
+        @app.get("/audio-worklet.js")
+        async def worklet() -> Response:
+            return Response(content=self.worklet_js, media_type="application/javascript")
+
+        @app.post("/session")
+        async def create_session(payload: SessionConfig) -> JSONResponse:
+            return await self._create_session(payload)
+
+        @app.websocket("/audio/{session_id}")
+        async def audio(session_id: str, websocket: WebSocket) -> None:
+            await self._handle_audio_socket(session_id, websocket)
 
         @app.get("/events/{session_id}")
         async def events(session_id: str) -> StreamingResponse:
@@ -207,7 +163,7 @@ class WebRTCService:
 
         return app
 
-    async def _handle_offer(self, payload: Offer) -> JSONResponse:
+    async def _create_session(self, payload: SessionConfig) -> JSONResponse:
         if payload.session_id in self.sessions:
             await self._cleanup_session(self.sessions[payload.session_id])
 
@@ -215,46 +171,101 @@ class WebRTCService:
             validate_chunk_config(payload.chunk_seconds, payload.overlap_seconds)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if payload.sample_rate <= 0:
+            raise HTTPException(status_code=400, detail="sample_rate must be > 0")
 
-        session = Session(
+        try:
+            audio_preprocessor = create_audio_preprocessor(payload.silence_detect)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}") from exc
+
+        self.sessions[payload.session_id] = Session(
             session_id=payload.session_id,
-            pc=RTCPeerConnection(),
             queue=asyncio.Queue(maxsize=64),
             save_sample=payload.save_sample,
             silence_detect=payload.silence_detect,
-            audio_preprocessor=None,
+            audio_preprocessor=audio_preprocessor,
             chunk_seconds=payload.chunk_seconds,
             overlap_seconds=payload.overlap_seconds,
+            sample_rate=payload.sample_rate,
         )
-        try:
-            session.audio_preprocessor = create_audio_preprocessor(payload.silence_detect)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}") from exc
-        self.sessions[payload.session_id] = session
-        self._register_peer_handlers(session)
+        return JSONResponse({"ok": True})
 
-        try:
-            await session.pc.setRemoteDescription(RTCSessionDescription(sdp=payload.sdp, type=payload.type))
-            answer = await session.pc.createAnswer()
-            await session.pc.setLocalDescription(answer)
-            return JSONResponse({"sdp": session.pc.localDescription.sdp, "type": session.pc.localDescription.type})
-        except Exception as exc:
+    async def _handle_audio_socket(self, session_id: str, websocket: WebSocket) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            await websocket.close(code=4404, reason="Unknown session")
+            return
+
+        if session.audio_socket is not None:
             await self._cleanup_session(session)
-            raise HTTPException(status_code=400, detail=f"WebRTC negotiation failed: {exc}") from exc
-
-    def _register_peer_handlers(self, session: Session) -> None:
-        @session.pc.on("track")
-        async def on_track(track: object) -> None:
-            if getattr(track, "kind", None) != "audio":
+            session = self.sessions.get(session_id)
+            if session is None:
+                await websocket.close(code=4409, reason="Session reset")
                 return
-            if session.worker is not None:
-                session.worker.cancel()
-            session.worker = asyncio.create_task(self._run_audio_worker(track, session))
 
-        @session.pc.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            if session.pc.connectionState in {"failed", "closed", "disconnected"}:
-                await self._cleanup_session(session)
+        await websocket.accept()
+        session.audio_socket = websocket
+        buffered = np.asarray([], dtype=np.float32)
+        chunk_samples = int(round(session.chunk_seconds * TARGET_SAMPLE_RATE))
+        stride_samples = chunk_samples - int(round(session.overlap_seconds * TARGET_SAMPLE_RATE))
+        if stride_samples <= 0:
+            await session.queue.put("[server error] Invalid chunk configuration.")
+            await self._cleanup_session(session)
+            return
+
+        try:
+            while True:
+                message = await websocket.receive()
+                audio = self._decode_audio_message(message, session.sample_rate)
+                if audio is None or audio.size == 0:
+                    continue
+
+                out_path = self._append_capture_audio(session, audio)
+                if out_path is not None and session.capture_samples == int(audio.size):
+                    await session.queue.put(f"[server] recording WAV capture: {out_path}")
+                buffered = np.concatenate((buffered, audio))
+
+                while buffered.shape[0] >= chunk_samples:
+                    chunk = buffered[:chunk_samples]
+                    buffered = buffered[stride_samples:]
+                    if np.max(np.abs(chunk), initial=0.0) < 1e-4:
+                        continue
+                    try:
+                        chunk = preprocess_audio(chunk, session.audio_preprocessor, self.ctx.verbose, self.ctx.start_time)
+                    except Exception as exc:
+                        await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")
+                        continue
+                    if session.silence_detect and chunk.size == 0:
+                        continue
+
+                    async with self.ctx.infer_lock:
+                        try:
+                            text = await asyncio.to_thread(transcribe_chunk, self.ctx.pipe, chunk, self.ctx.generate_kwargs)
+                        except Exception as exc:
+                            details = likely_reason_details(exc)
+                            await session.queue.put(f"[server error] Live transcription failed: {details[0]}")
+                            continue
+                    if text:
+                        await session.queue.put(text)
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            try:
+                await session.queue.put(f"[server error] Audio stream failed: {exc}")
+            except Exception:
+                pass
+        finally:
+            await self._cleanup_session(session)
+
+    def _decode_audio_message(self, message: dict[str, object], input_sample_rate: int) -> np.ndarray | None:
+        raw = message.get("bytes")
+        if not raw:
+            return None
+        audio = np.frombuffer(raw, dtype=np.float32).astype(np.float32, copy=False)
+        if input_sample_rate != TARGET_SAMPLE_RATE:
+            audio = resample_audio_linear(audio, input_sample_rate, TARGET_SAMPLE_RATE)
+        return audio
 
     async def _event_stream(self, session: Session) -> object:
         while True:
@@ -297,14 +308,12 @@ class WebRTCService:
         return session.capture_path
 
     async def _cleanup_session(self, session: Session) -> None:
-        if session.worker is not None:
-            session.worker.cancel()
+        if session.audio_socket is not None:
             try:
-                await session.worker
-            except asyncio.CancelledError:
-                pass
+                await session.audio_socket.close()
             except Exception:
                 pass
+            session.audio_socket = None
 
         saved_path = self._close_capture_writer(session)
         if saved_path is not None:
@@ -314,78 +323,16 @@ class WebRTCService:
             except Exception:
                 pass
 
-        await session.pc.close()
         self.sessions.pop(session.session_id, None)
-
-    def _create_resampler(self) -> tuple[object | None, str | None]:
-        try:
-            from av.audio.resampler import AudioResampler
-
-            return AudioResampler(format="fltp", layout="mono", rate=TARGET_SAMPLE_RATE), None
-        except Exception as exc:
-            return None, f"[server] audio resampler unavailable, using fallback conversion: {exc}"
-
-    async def _run_audio_worker(self, track: object, session: Session) -> None:
-        chunk_seconds = session.chunk_seconds if session.chunk_seconds > 0 else self.ctx.chunk_seconds
-        overlap_seconds = session.overlap_seconds if session.overlap_seconds >= 0 else self.ctx.overlap_seconds
-        chunk_samples = int(round(chunk_seconds * TARGET_SAMPLE_RATE))
-        stride_samples = chunk_samples - int(round(overlap_seconds * TARGET_SAMPLE_RATE))
-        if stride_samples <= 0:
-            await session.queue.put("[server error] Invalid chunk configuration.")
-            return
-
-        resampler, warning = self._create_resampler()
-        if warning is not None:
-            await session.queue.put(warning)
-
-        buffered = np.asarray([], dtype=np.float32)
-        while True:
-            frame = await track.recv()
-            chunks = frame_to_target_audio(frame, resampler)
-            if not chunks:
-                continue
-
-            for audio in chunks:
-                out_path = self._append_capture_audio(session, audio)
-                if out_path is not None and session.capture_samples == int(audio.size):
-                    await session.queue.put(f"[server] recording WAV capture: {out_path}")
-                buffered = np.concatenate((buffered, audio))
-
-            while buffered.shape[0] >= chunk_samples:
-                chunk = buffered[:chunk_samples]
-                buffered = buffered[stride_samples:]
-                if np.max(np.abs(chunk), initial=0.0) < 1e-4:
-                    continue
-                try:
-                    chunk = preprocess_audio(chunk, session.audio_preprocessor, self.ctx.verbose, self.ctx.start_time)
-                except Exception as exc:
-                    await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")
-                    continue
-                if session.silence_detect and chunk.size == 0:
-                    continue
-
-                async with self.ctx.infer_lock:
-                    try:
-                        text = await asyncio.to_thread(transcribe_chunk, self.ctx.pipe, chunk, self.ctx.generate_kwargs)
-                    except Exception as exc:
-                        details = likely_reason_details(exc)
-                        await session.queue.put(f"[server error] Live transcription failed: {details[0]}")
-                        continue
-                if text:
-                    await session.queue.put(text)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve a browser page and transcribe client microphone over WebRTC.")
+    parser = argparse.ArgumentParser(description="Serve a browser page and transcribe client microphone over AudioWorklet/WebSocket.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the HTTP server (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind the HTTP server (default: 8000).")
     parser.add_argument("--tls-certfile", type=pathlib.Path, default=None, help="TLS certificate file (PEM).")
     parser.add_argument("--tls-keyfile", type=pathlib.Path, default=None, help="TLS private key file (PEM).")
-    parser.add_argument(
-        "--device",
-        default="NPU,GPU,CPU",
-        help="Device preference order using NPU,GPU,CPU, or 'list' to print detected devices.",
-    )
+    parser.add_argument("--device", default="NPU,GPU,CPU", help="Device preference order using NPU,GPU,CPU, or 'list' to print detected devices.")
     parser.add_argument(
         "--model",
         type=pathlib.Path,
@@ -409,25 +356,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable noise reduction and WebRTC VAD speech gating by default; the browser checkbox can still enable it per session.",
     )
     parser.set_defaults(silence_detect=True)
-    parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=DEFAULT_CHUNK_SECONDS,
-        help=f"Chunk duration in seconds for server-side transcription windows (default: {DEFAULT_CHUNK_SECONDS}).",
-    )
-    parser.add_argument(
-        "--overlap-seconds",
-        type=float,
-        default=DEFAULT_OVERLAP_SECONDS,
-        help=f"Chunk overlap in seconds to preserve context across windows (default: {DEFAULT_OVERLAP_SECONDS}).",
-    )
+    parser.add_argument("--chunk-seconds", type=float, default=DEFAULT_CHUNK_SECONDS, help=f"Chunk duration in seconds for server-side transcription windows (default: {DEFAULT_CHUNK_SECONDS}).")
+    parser.add_argument("--overlap-seconds", type=float, default=DEFAULT_OVERLAP_SECONDS, help=f"Chunk overlap in seconds to preserve context across windows (default: {DEFAULT_OVERLAP_SECONDS}).")
     parser.add_argument("--profile", action="store_true", help="Enable py-spy profiling for this run.")
-    parser.add_argument(
-        "--profile-output",
-        type=pathlib.Path,
-        default=None,
-        help="Optional py-spy output SVG path (default: profiles/<timestamp>.svg).",
-    )
+    parser.add_argument("--profile-output", type=pathlib.Path, default=None, help="Optional py-spy output SVG path (default: profiles/<timestamp>.svg).")
     parser.add_argument("--verbose", action="store_true", help="Print progress logs to stderr.")
     return parser.parse_args(argv)
 
@@ -446,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     profile_session = start_py_spy_profile(
         enabled=args.profile,
-        label="local-ai-voice-webrtc",
+        label="local-ai-voice-web",
         output_path=args.profile_output,
     )
     try:
@@ -470,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: uvicorn is not available: {exc}", file=sys.stderr)
             return 3
 
-        service = WebRTCService(ctx=ctx, index_html=load_index_html(ctx.silence_detect_default))
+        service = AudioStreamService(ctx=ctx, index_html=load_index_html(ctx.silence_detect_default), worklet_js=load_worklet_js())
         scheme = "https" if args.tls_certfile is not None else "http"
         log(f"Starting server on {scheme}://{args.host}:{args.port}", args.verbose, start_time)
         uvicorn.run(

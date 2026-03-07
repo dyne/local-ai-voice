@@ -439,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local Whisper transcription and WebRTC server.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("transcribe", help="Run file or live microphone transcription.")
-    subparsers.add_parser("web", help="Run the browser WebRTC transcription server.")
+    subparsers.add_parser("web", help="Run the browser audio streaming transcription server.")
     args = parser.parse_args(raw_argv[:1])
 
     if args.command == "web":
