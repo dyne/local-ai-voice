@@ -16,6 +16,7 @@ Applies to the single script:
 - `local-ai-voice.py --server` runs the raw browser server without the desktop wrapper.
 - `local-ai-voice.py --cli` forces the non-web CLI path for file or live microphone transcription.
 - Can auto-download OpenVINO Whisper models from Hugging Face Hub and reuse the shared Hugging Face cache.
+- If `pywebview` is unavailable or fails to initialize, desktop startup must fall back to server-only mode and print the local URL.
 
 ## Non-Negotiable Behavior
 - Resample to `16000 Hz` for Whisper.
@@ -25,6 +26,7 @@ Applies to the single script:
 - Keep error messages concise and diagnostic (what failed + likely reason).
 - Keep model execution on OpenVINO GenAI for `NPU`, `GPU`, and `CPU`.
 - When `--model` is explicitly provided, do not silently fall back to a different model.
+- Keep desktop-web fallback non-fatal: server mode should still start if `pywebview` cannot run.
 
 ## CLI Defaults
 - `--device` default: `NPU,GPU,CPU`
@@ -34,6 +36,7 @@ Applies to the single script:
 - `--model` accepts either a local OpenVINO model directory or a Hugging Face repo id in `org/name` form.
 - `--offline` disables model downloads and must fail fast if the required model is not already available locally.
 - Default mode is desktop web UI; use `--cli` for file/live transcription and `--server` for raw browser-server mode.
+- Default desktop mode should prefer loopback-only hosting and open a local `pywebview` window when supported.
 - `--chunk-seconds` must be a positive number when running in live mode.
 - Browser mode defaults:
   - `--vad-mode 3`
@@ -46,6 +49,7 @@ Applies to the single script:
 - Reuse the standard shared Hugging Face cache; do not re-download models that are already cached locally.
 - Support `HF_TOKEN` when present for authenticated Hugging Face downloads.
 - Include `huggingface_hub[hf_xet]`/`hf_xet` in packaging so frozen builds can use Xet-backed model downloads.
+- Include `pywebview` in packaging for Windows and Linux builds.
 
 # Validation Checklist
 1. `py -3.11 -m py_compile local-ai-voice.py local_ai_voice.py voice_runtime.py browser_webrtc.py`
@@ -58,6 +62,7 @@ Applies to the single script:
 5. Browser startup test after browser-mode changes:
    - `py -3.11 .\local-ai-voice.py --model <model_dir>`
    - `py -3.11 .\local-ai-voice.py --server --model <model_dir>`
+   - Confirm desktop mode falls back to a printed local URL when `pywebview` is unavailable.
 6. Run one auto-download or offline-path check when adjusting model resolution:
    - `py -3.11 .\local-ai-voice.py --cli <wav> --device CPU --model OpenVINO/whisper-tiny-fp16-ov`
    - `py -3.11 .\local-ai-voice.py --cli <wav> --offline --model <missing_model_dir>`
