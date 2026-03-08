@@ -22,10 +22,10 @@ from local_ai.slices.voice.shared.audio_processing import (
     TARGET_SAMPLE_RATE,
     create_audio_preprocessor,
     normalize_audio_format,
-    preprocess_audio,
-    resample_audio_linear,
 )
 from local_ai.slices.voice.shared.transcript_policy import should_suppress_transcript, transcribe_chunk
+from local_ai.slices.voice.transcribe_stream.request import TranscribeStreamChunkRequest
+from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunks
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai_voice import (
@@ -279,44 +279,32 @@ class AudioStreamService:
                     )
                 if audio.size == 0:
                     continue
-                if session.stream_sample_rate is None:
-                    session.stream_sample_rate = sample_rate
-                elif session.stream_sample_rate != sample_rate:
-                    if buffered.size > 0:
-                        buffered = resample_audio_linear(buffered, session.stream_sample_rate, sample_rate)
-                    session.stream_sample_rate = sample_rate
-
-                buffered = np.concatenate((buffered, audio))
-                chunk_samples = int(round(session.chunk_seconds * session.stream_sample_rate))
-                stride_samples = chunk_samples - int(round(session.overlap_seconds * session.stream_sample_rate))
-                if stride_samples <= 0:
+                prepared = prepare_stream_chunks(
+                    request=TranscribeStreamChunkRequest(
+                        incoming_audio=audio,
+                        incoming_sample_rate=sample_rate,
+                        buffered_audio=buffered,
+                        current_stream_sample_rate=session.stream_sample_rate,
+                        chunk_seconds=session.chunk_seconds,
+                        overlap_seconds=session.overlap_seconds,
+                        silence_detect=session.silence_detect,
+                        audio_preprocessor=session.audio_preprocessor,
+                        verbose=self.ctx.verbose,
+                        start=self.ctx.start_time,
+                    ),
+                    logger=log,
+                )
+                buffered = prepared.buffered_audio
+                session.stream_sample_rate = prepared.stream_sample_rate
+                if prepared.error is not None:
                     await session.queue.put("[server error] Invalid chunk configuration.")
                     await self._cleanup_session(session)
                     return
 
-                while buffered.shape[0] >= chunk_samples:
-                    chunk = buffered[:chunk_samples]
-                    buffered = buffered[stride_samples:]
-                    if np.max(np.abs(chunk), initial=0.0) < 1e-4:
-                        continue
-                    try:
-                        chunk = preprocess_audio(
-                            chunk,
-                            session.stream_sample_rate,
-                            session.audio_preprocessor,
-                            self.ctx.verbose,
-                            self.ctx.start_time,
-                            log,
-                        )
-                    except Exception as exc:
-                        await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")
-                        continue
-                    if session.silence_detect and chunk.size == 0:
-                        if session.model_chunks == 0:
-                            await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
-                        continue
-                    if session.stream_sample_rate != TARGET_SAMPLE_RATE:
-                        chunk = resample_audio_linear(chunk, session.stream_sample_rate, TARGET_SAMPLE_RATE)
+                if prepared.rejected_by_preprocessor and session.model_chunks == 0:
+                    await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
+
+                for chunk in prepared.model_inputs:
                     out_path = self._append_capture_audio(session, chunk)
                     if out_path is not None and session.capture_samples == int(chunk.size):
                         await session.queue.put(f"[server] recording WAV capture: {out_path}")
