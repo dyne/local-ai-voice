@@ -506,7 +506,17 @@ def build_transcribe_parser(*, include_web_flag: bool = False) -> argparse.Argum
         parser.add_argument(
             "--web",
             action="store_true",
-            help="Run the browser audio streaming transcription server instead of file/live transcription.",
+            help="Open the desktop web UI instead of file/live transcription.",
+        )
+        parser.add_argument(
+            "--server",
+            action="store_true",
+            help="Run the browser audio streaming transcription server without the desktop wrapper.",
+        )
+        parser.add_argument(
+            "--cli",
+            action="store_true",
+            help="Force the non-web CLI mode for file or live microphone transcription.",
         )
     parser.add_argument("wav_path", type=pathlib.Path, nargs="?", help="Optional input .wav path.")
     parser.add_argument(
@@ -629,22 +639,46 @@ def run_transcribe(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if any(arg in {"-h", "--help"} for arg in raw_argv) and "--web" not in raw_argv:
+    if any(arg in {"-h", "--help"} for arg in raw_argv) and "--web" not in raw_argv and "--server" not in raw_argv:
         build_transcribe_parser(include_web_flag=True).parse_args(raw_argv)
         return 0
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--web",
         action="store_true",
-        help="Run the browser audio streaming transcription server instead of file/live transcription.",
+        help="Open the desktop web UI instead of file/live transcription.",
+    )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Run the browser audio streaming transcription server without the desktop wrapper.",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Force the non-web CLI mode for file or live microphone transcription.",
     )
     args, remaining = parser.parse_known_args(raw_argv)
 
+    if args.server:
+        import browser_webrtc
+
+        return browser_webrtc.run_server(browser_webrtc.parse_args(remaining))
     if args.web:
         import browser_webrtc
 
-        return browser_webrtc.main(remaining)
-    return run_transcribe(remaining)
+        return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
+    if args.cli:
+        return run_transcribe(remaining)
+    if any(not arg.startswith("-") for arg in remaining):
+        return run_transcribe(remaining)
+    if remaining:
+        import browser_webrtc
+
+        return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
+    import browser_webrtc
+
+    return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
 
 
 if __name__ == "__main__":

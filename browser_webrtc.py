@@ -5,7 +5,9 @@ import argparse
 import asyncio
 import io
 import pathlib
+import socket
 import sys
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -508,8 +510,19 @@ def validate_tls_args(args: argparse.Namespace) -> None:
         raise ValueError(f"TLS key file not found: {args.tls_keyfile}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def prepare_server(args: argparse.Namespace) -> tuple[ServerContext, AudioStreamService, float]:
+    validate_tls_args(args)
+    validate_chunk_config(args.chunk_seconds, args.overlap_seconds)
+    start_time = time.perf_counter()
+    ctx = create_context(args, start_time)
+    service = AudioStreamService(
+        ctx=ctx,
+        index_html=load_index_html(ctx.silence_detect_default, ctx.vad_mode_default),
+    )
+    return ctx, service, start_time
+
+
+def run_server(args: argparse.Namespace) -> int:
     profile_session = start_py_spy_profile(
         enabled=args.profile,
         label="local-ai-voice-web",
@@ -517,18 +530,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         try:
-            validate_tls_args(args)
-            validate_chunk_config(args.chunk_seconds, args.overlap_seconds)
+            ctx, service, start_time = prepare_server(args)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
-
-        start_time = time.perf_counter()
-        try:
-            ctx = create_context(args, start_time)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 3
+
         print(f"Using device: {ctx.selected_device}", file=sys.stderr, flush=True)
         print(f"Using model: {ctx.model_dir}", file=sys.stderr, flush=True)
         enable_loopback_only_network()
@@ -539,10 +548,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: uvicorn is not available: {exc}", file=sys.stderr)
             return 3
 
-        service = AudioStreamService(
-            ctx=ctx,
-            index_html=load_index_html(ctx.silence_detect_default, ctx.vad_mode_default),
-        )
         scheme = "https" if args.tls_certfile is not None else "http"
         log(f"Starting server on {scheme}://{args.host}:{args.port}", args.verbose, start_time)
         uvicorn.run(
@@ -556,6 +561,106 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         stop_py_spy_profile(profile_session)
+
+
+def desktop_host() -> str:
+    return "127.0.0.1"
+
+
+def find_free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def wait_for_server(host: str, port: int, timeout_seconds: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError(f"Timed out waiting for local server on {host}:{port}")
+
+
+def _print_fallback_url(args: argparse.Namespace) -> None:
+    scheme = "https" if args.tls_certfile is not None else "http"
+    print(f"Desktop UI unavailable. Open {scheme}://{args.host}:{args.port} in a browser.", file=sys.stderr, flush=True)
+
+
+def run_desktop(args: argparse.Namespace) -> int:
+    profile_session = start_py_spy_profile(
+        enabled=args.profile,
+        label="local-ai-voice-webview",
+        output_path=args.profile_output,
+    )
+    try:
+        try:
+            args.host = desktop_host()
+            if args.port == 8000:
+                args.port = find_free_port(args.host)
+            ctx, service, start_time = prepare_server(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 3
+
+        print(f"Using device: {ctx.selected_device}", file=sys.stderr, flush=True)
+        print(f"Using model: {ctx.model_dir}", file=sys.stderr, flush=True)
+
+        try:
+            import uvicorn
+            import webview
+        except Exception as exc:
+            print(f"Desktop UI unavailable: {exc}", file=sys.stderr, flush=True)
+            _print_fallback_url(args)
+            return run_server(args)
+
+        config = uvicorn.Config(
+            service.build_app(),
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            ssl_certfile=str(args.tls_certfile) if args.tls_certfile is not None else None,
+            ssl_keyfile=str(args.tls_keyfile) if args.tls_keyfile is not None else None,
+        )
+        server = uvicorn.Server(config)
+        server.install_signal_handlers = lambda: None
+
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        wait_for_server(args.host, args.port)
+        enable_loopback_only_network()
+
+        scheme = "https" if args.tls_certfile is not None else "http"
+        url = f"{scheme}://{args.host}:{args.port}"
+        log(f"Starting desktop UI on {url}", args.verbose, start_time)
+        try:
+            webview.create_window("Local AI Voice", url, width=1280, height=900)
+            webview.start()
+        except Exception as exc:
+            print(f"Desktop UI unavailable: {exc}", file=sys.stderr, flush=True)
+            _print_fallback_url(args)
+            server.should_exit = True
+            server_thread.join(timeout=10.0)
+            return run_server(args)
+
+        server.should_exit = True
+        server_thread.join(timeout=10.0)
+        if server.force_exit:
+            return 3
+        return 0
+    finally:
+        stop_py_spy_profile(profile_session)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    return run_server(args)
 
 
 if __name__ == "__main__":

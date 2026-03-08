@@ -19,10 +19,10 @@ PIP := $(PYTHON) -m pip
 SCRIPT := local-ai-voice.py
 APP_NAME := local-ai-voice
 SPEC := $(APP_NAME).spec
-REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av huggingface_hub[hf_xet]
+REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av pywebview huggingface_hub[hf_xet]
 OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
 
-.PHONY: all install install-build spec build build-webrtc run run-web clean
+.PHONY: all install install-build spec build build-webrtc run run-web run-server clean
 
 all: install
 
@@ -43,6 +43,8 @@ spec: install-build
 		--hidden-import av \
 		--hidden-import noisereduce \
 		--hidden-import webrtcvad \
+		--hidden-import webview \
+		--hidden-import hf_xet \
 		--additional-hooks-dir hooks \
 		--collect-binaries openvino \
 		--collect-data openvino \
@@ -50,6 +52,9 @@ spec: install-build
 		--collect-data openvino_genai \
 		--collect-binaries openvino_tokenizers \
 		--collect-data openvino_tokenizers \
+		--collect-data webview \
+		--collect-binaries hf_xet \
+		--collect-data hf_xet \
 		--add-data "web/index.html$(DATA_SEP)web" \
 		$(SCRIPT)
 
@@ -63,6 +68,9 @@ run:
 
 run-web:
 	$(PYTHON) $(SCRIPT) --web
+
+run-server:
+	$(PYTHON) $(SCRIPT) --server
 
 clean:
 	$(RM) -r build dist __pycache__ *.spec

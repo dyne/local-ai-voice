@@ -32,38 +32,69 @@ py -3.11 -m venv .venv
 make install
 ```
 
+## Run desktop web UI
+
+Open the desktop app wrapper around the local web UI:
+
+```sh
+py -3.11 ./local-ai-voice.py
+```
+
+The desktop window runs the same local browser UI through `pywebview` and starts
+the local transcription server automatically.
+
+Make target:
+
+```sh
+make run
+```
+
+Run the raw web server without the desktop wrapper:
+
+```sh
+py -3.11 ./local-ai-voice.py --server
+```
+
+Make target:
+
+```sh
+make run-server
+```
+
 ## Run local transcription
+
+Force CLI mode for file or live microphone transcription:
 
 Transcribe a WAV file:
 
 ```sh
-py -3.11 ./local-ai-voice.py input.wav --model ./whisper-tiny-fp16-ov
+py -3.11 ./local-ai-voice.py --cli input.wav --model ./whisper-tiny-fp16-ov
 ```
 
 Run live microphone transcription:
 
 ```sh
-py -3.11 ./local-ai-voice.py --model ./whisper-tiny-fp16-ov --chunk-seconds 1.0
+py -3.11 ./local-ai-voice.py --cli --model ./whisper-tiny-fp16-ov --chunk-seconds 1.0
 ```
 
 Noise reduction and WebRTC VAD speech gating are enabled by default. Disable them with:
 
 ```sh
-py -3.11 ./local-ai-voice.py --no-silence-detect --model ./whisper-tiny-fp16-ov input.wav
+py -3.11 ./local-ai-voice.py --cli --no-silence-detect --model ./whisper-tiny-fp16-ov input.wav
 ```
 
 ## Run browser transcription
 
-Start the local browser transcription server:
+Open the desktop web UI:
 
 ```sh
-make run-web
+make run
 ```
 
 Equivalent direct command:
 
 ```sh
-py -3.11 ./local-ai-voice.py --web --model ./whisper-tiny-fp16-ov
+py -3.11 ./local-ai-voice.py --model ./whisper-tiny-fp16-ov
 ```
 
 The browser UI captures microphone audio in the browser and streams Opus over a
@@ -96,8 +127,9 @@ make build
 The resulting binary supports both modes:
 
 ```sh
-.\dist\local-ai-voice.exe input.wav --model .\whisper-tiny-fp16-ov
-.\dist\local-ai-voice.exe --web --model .\whisper-tiny-fp16-ov
+.\dist\local-ai-voice.exe
+.\dist\local-ai-voice.exe --cli input.wav --model .\whisper-tiny-fp16-ov
+.\dist\local-ai-voice.exe --server --model .\whisper-tiny-fp16-ov
 ```
 
 # License

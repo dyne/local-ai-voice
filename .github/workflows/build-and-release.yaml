@@ -26,7 +26,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
-          python -m pip install numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av "huggingface_hub[hf_xet]"
+          python -m pip install numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av pywebview "huggingface_hub[hf_xet]"
           python -m pip install --upgrade openvino openvino-genai openvino-tokenizers
 
       - name: Generate PyInstaller spec
@@ -40,6 +40,8 @@ jobs:
             --hidden-import av `
             --hidden-import noisereduce `
             --hidden-import webrtcvad `
+            --hidden-import webview `
+            --hidden-import hf_xet `
             --additional-hooks-dir hooks `
             --collect-binaries openvino `
             --collect-data openvino `
@@ -47,6 +49,9 @@ jobs:
             --collect-data openvino_genai `
             --collect-binaries openvino_tokenizers `
             --collect-data openvino_tokenizers `
+            --collect-data webview `
+            --collect-binaries hf_xet `
+            --collect-data hf_xet `
             --add-data "web/index.html;web" `
             local-ai-voice.py
 
@@ -104,7 +109,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
-          python -m pip install numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av "huggingface_hub[hf_xet]"
+          python -m pip install numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av pywebview "huggingface_hub[hf_xet]"
           python -m pip install --upgrade openvino openvino-genai openvino-tokenizers
 
       - name: Generate PyInstaller spec
@@ -115,6 +120,8 @@ jobs:
             --hidden-import av \
             --hidden-import noisereduce \
             --hidden-import webrtcvad \
+            --hidden-import webview \
+            --hidden-import hf_xet \
             --additional-hooks-dir hooks \
             --collect-binaries openvino \
             --collect-data openvino \
@@ -122,6 +129,9 @@ jobs:
             --collect-data openvino_genai \
             --collect-binaries openvino_tokenizers \
             --collect-data openvino_tokenizers \
+            --collect-data webview \
+            --collect-binaries hf_xet \
+            --collect-data hf_xet \
             --add-data "web/index.html:web" \
             local-ai-voice.py
 
