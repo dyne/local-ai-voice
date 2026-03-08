@@ -118,7 +118,7 @@ async def test_cleanup_session_closes_socket_emits_saved_capture_and_removes_ses
         session.queue.put_nowait("[server] saved WAV capture: capture.wav (2.00s)")
         sessions.pop(session.session_id, None)
 
-    monkeypatch.setattr("browser_webrtc.cleanup_session", fake_cleanup)
+    monkeypatch.setattr("local_ai.slices.voice.web_ui.service.cleanup_session", fake_cleanup)
 
     await service._cleanup_session(session)
 
@@ -136,7 +136,7 @@ async def test_decode_audio_message_resets_session_state_on_overflow(monkeypatch
     session.decoded_sample_rate = 16000
 
     monkeypatch.setattr(
-        "browser_webrtc.decode_audio_message",
+        "local_ai.slices.voice.web_ui.service.decode_audio_message",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Encoded audio buffer overflow; browser stream is not decodable.")),
     )
 
