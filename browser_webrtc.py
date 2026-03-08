@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from local_ai.slices.voice.web_ui.app_factory import build_browser_app
+from local_ai.slices.voice.web_ui.chunk_pipeline import process_prepared_chunks
 from local_ai.slices.voice.shared.audio_processing import (
     TARGET_SAMPLE_RATE,
     create_audio_preprocessor,
@@ -237,30 +238,27 @@ class AudioStreamService:
                 if prepared.rejected_by_preprocessor and session.model_chunks == 0:
                     await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
 
-                for chunk in prepared.model_inputs:
-                    out_path = append_capture_audio(session, chunk)
-                    if out_path is not None and session.capture_samples == int(chunk.size):
-                        await session.queue.put(f"[server] recording WAV capture: {out_path}")
-                    session.model_chunks += 1
-                    if session.model_chunks <= 4:
-                        await self._debug(session, f"model chunk #{session.model_chunks} samples={chunk.size} sample_rate={TARGET_SAMPLE_RATE}")
-
-                    inference = await run_chunk_inference(
+                async def infer_for_chunk(*, chunk: np.ndarray, audio_preprocessor: object | None) -> object:
+                    return await run_chunk_inference(
                         chunk=chunk,
                         pipe=self.ctx.pipe,
                         generate_kwargs=self.ctx.generate_kwargs,
-                        audio_preprocessor=session.audio_preprocessor,
+                        audio_preprocessor=audio_preprocessor,
                         infer_lock=self.ctx.infer_lock,
                         transcribe_fn=transcribe_chunk,
                         should_suppress_fn=should_suppress_transcript,
                         likely_reason_details_fn=likely_reason_details,
                         to_thread_fn=asyncio.to_thread,
                     )
-                    if inference.error is not None:
-                        await session.queue.put(inference.error)
-                        continue
-                    if inference.text is not None:
-                        await session.queue.put(inference.text)
+
+                await process_prepared_chunks(
+                    session=session,
+                    chunks=prepared.model_inputs,
+                    target_sample_rate=TARGET_SAMPLE_RATE,
+                    append_capture_audio_fn=append_capture_audio,
+                    run_chunk_inference_fn=infer_for_chunk,
+                    debug_fn=self._debug,
+                )
         except WebSocketDisconnect:
             pass
         except Exception as exc:
