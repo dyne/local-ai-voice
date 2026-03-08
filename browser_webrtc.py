@@ -29,6 +29,7 @@ from local_ai.slices.voice.web_ui.capture_store import (
     append_capture_audio,
     close_capture_writer,
 )
+from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
     validate_chunk_config,
@@ -320,14 +321,8 @@ class AudioStreamService:
         return try_decode_bytes(payload=payload, mime_type=mime_type)
 
     async def _event_stream(self, session: SessionState) -> object:
-        while True:
-            try:
-                line = await asyncio.wait_for(session.queue.get(), timeout=15.0)
-                yield f"data: {line}\n\n"
-            except asyncio.TimeoutError:
-                yield "event: ping\ndata: keepalive\n\n"
-            except asyncio.CancelledError:
-                break
+        async for item in event_stream(queue=session.queue, ping_timeout=15.0):
+            yield item
 
     async def _cleanup_session(self, session: SessionState) -> None:
         if session.audio_socket is not None:
