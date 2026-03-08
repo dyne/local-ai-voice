@@ -18,18 +18,19 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from network_guard import enable_loopback_only_network
-from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
-from local_ai_voice import (
+from local_ai.slices.voice.shared.audio_processing import (
     TARGET_SAMPLE_RATE,
-    configure_openvino_runtime_env,
     create_audio_preprocessor,
-    log,
     normalize_audio_format,
     preprocess_audio,
     resample_audio_linear,
-    should_suppress_transcript,
-    transcribe_chunk,
+)
+from local_ai.slices.voice.shared.transcript_policy import should_suppress_transcript, transcribe_chunk
+from network_guard import enable_loopback_only_network
+from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
+from local_ai_voice import (
+    configure_openvino_runtime_env,
+    log,
 )
 from local_ai.infrastructure.openvino.whisper import create_whisper_runtime, likely_reason_details
 from local_ai.shared.domain.errors import DeviceListRequested, PipelineSetupError
@@ -305,6 +306,7 @@ class AudioStreamService:
                             session.audio_preprocessor,
                             self.ctx.verbose,
                             self.ctx.start_time,
+                            log,
                         )
                     except Exception as exc:
                         await session.queue.put(f"[server error] Audio preprocessing failed: {exc}")

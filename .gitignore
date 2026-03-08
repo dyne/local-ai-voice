@@ -1,3 +1,7 @@
 *.spec
 dist
 captures
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc

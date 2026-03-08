@@ -1,0 +1,1 @@
+"""Voice file transcription slice."""
