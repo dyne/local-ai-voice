@@ -30,6 +30,7 @@ from local_ai.slices.voice.web_ui.capture_store import (
     close_capture_writer,
 )
 from local_ai.slices.voice.web_ui.event_stream import event_stream
+from local_ai.slices.voice.web_ui.launch_helpers import fallback_url, wait_for_server
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
     validate_chunk_config,
@@ -447,20 +448,12 @@ def find_free_port(host: str) -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_for_server(host: str, port: int, timeout_seconds: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.5):
-                return
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError(f"Timed out waiting for local server on {host}:{port}")
-
-
 def _print_fallback_url(args: argparse.Namespace) -> None:
-    scheme = "https" if args.tls_certfile is not None else "http"
-    print(f"Desktop UI unavailable. Open {scheme}://{args.host}:{args.port} in a browser.", file=sys.stderr, flush=True)
+    print(
+        f"Desktop UI unavailable. Open {fallback_url(host=args.host, port=args.port, tls_certfile=args.tls_certfile)} in a browser.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def run_desktop(args: argparse.Namespace) -> int:
