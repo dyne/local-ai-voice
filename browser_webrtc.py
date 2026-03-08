@@ -32,6 +32,7 @@ from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
 from local_ai.slices.voice.web_ui.runtime_context import create_server_context
+from local_ai.slices.voice.web_ui.session_decoder import decode_session_message
 from local_ai.slices.voice.web_ui.session_registry import (
     close_unknown_session,
     replace_existing_session,
@@ -263,32 +264,16 @@ class AudioStreamService:
             await self._cleanup_session(session)
 
     def _decode_audio_message(self, session: Session, message: dict[str, object]) -> tuple[np.ndarray, int] | None:
-        raw = message.get("bytes")
-        if raw:
-            session.decode_attempts += 1
-        try:
-            decoded = decode_audio_message(
-                raw=raw if isinstance(raw, (bytes, bytearray)) else None,
-                encoded_buffer=session.encoded_buffer,
-                decoded_sample_cursor=session.decoded_sample_cursor,
-                decoded_sample_rate=session.decoded_sample_rate,
-                mime_type=session.mime_type,
-                max_encoded_buffer_bytes=MAX_ENCODED_BUFFER_BYTES,
+        return decode_session_message(
+            session=session,
+            message=message,
+            max_encoded_buffer_bytes=MAX_ENCODED_BUFFER_BYTES,
+            decode_message=lambda **kwargs: decode_audio_message(
                 decode_payload=self._try_decode_bytes,
-                invalid_data_error_type=av.error.InvalidDataError,
-            )
-        except RuntimeError:
-            session.encoded_buffer.clear()
-            session.decoded_sample_cursor = 0
-            session.decoded_sample_rate = None
-            raise
-
-        session.encoded_buffer = decoded.encoded_buffer
-        session.decoded_sample_cursor = decoded.decoded_sample_cursor
-        session.decoded_sample_rate = decoded.decoded_sample_rate
-        if decoded.audio is None or decoded.sample_rate is None:
-            return None
-        return decoded.audio, decoded.sample_rate
+                **kwargs,
+            ),
+            invalid_data_error_type=av.error.InvalidDataError,
+        )
 
     def _try_decode_bytes(self, payload: bytes, mime_type: str | None) -> tuple[np.ndarray, int] | None:
         return try_decode_bytes(payload=payload, mime_type=mime_type)
