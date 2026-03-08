@@ -18,6 +18,7 @@ from local_ai.slices.voice.shared.transcript_policy import (
 )
 from local_ai.slices.voice.transcribe_file.request import TranscribeFileRequest
 from local_ai.slices.voice.transcribe_file.service import execute_transcribe_file
+from local_ai.slices.voice.transcribe_runner import execute_transcribe_args
 from local_ai.slices.voice.transcribe_live.request import TranscribeLiveRequest
 from local_ai.slices.voice.transcribe_live.service import execute_transcribe_live
 from local_ai.slices.voice.entrypoint import dispatch_voice_entry
@@ -26,11 +27,6 @@ from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai.infrastructure.openvino.whisper import (
     create_whisper_runtime,
-    likely_reason_details,
-)
-from local_ai.shared.domain.errors import (
-    DeviceListRequested,
-    PipelineSetupError,
 )
 
 
@@ -193,52 +189,22 @@ def run_transcribe(argv: list[str] | None = None) -> int:
         output_path=args.profile_output,
     )
     try:
-        start = time.perf_counter()
-        configure_openvino_runtime_env()
-
-        try:
-            runtime = create_whisper_runtime(
-                args=args,
-                base_dir=pathlib.Path(__file__).resolve().parent,
-                logger=log,
-                verbose=args.verbose,
-                start_time=start,
-            )
-        except DeviceListRequested as exc:
-            if not exc.devices:
-                print("No OpenVINO devices detected")
-                return 1
-            for dev in exc.devices:
-                print(dev)
-            return 0
-        except PipelineSetupError as exc:
-            return fail(exc.reason, exc.details, exit_code=setup_error_exit_code(exc.reason))
-
-        print(f"Using device: {runtime.selected_device}", file=sys.stderr, flush=True)
-        print(f"Using model: {runtime.model_dir}", file=sys.stderr, flush=True)
-        enable_loopback_only_network()
-
-        pipe = runtime.pipe
-        try:
-            audio_preprocessor = create_audio_preprocessor(
-                args.silence_detect,
-                vad_mode=args.vad_mode,
-                min_speech_frames=args.vad_min_speech_frames,
-                min_speech_ratio=args.vad_min_speech_ratio,
-                min_utterance_ms=args.vad_min_utterance_ms,
-                hangover_ms=args.vad_hangover_ms,
-            )
-        except Exception as exc:
-            return fail("Audio preprocessing failed.", [f"Runtime error: {exc}", NR_IMPORT_ERROR], exit_code=6)
-        generate_kwargs = runtime.generate_kwargs
-        status = (
-            run_file_mode(args, pipe, audio_preprocessor, generate_kwargs, start)
-            if args.wav_path
-            else run_live_mode(args, pipe, audio_preprocessor, generate_kwargs, start)
+        return execute_transcribe_args(
+            args=args,
+            perf_counter_fn=time.perf_counter,
+            configure_runtime_env_fn=configure_openvino_runtime_env,
+            create_runtime_fn=create_whisper_runtime,
+            create_audio_preprocessor_fn=create_audio_preprocessor,
+            enable_loopback_only_network_fn=enable_loopback_only_network,
+            run_file_mode_fn=run_file_mode,
+            run_live_mode_fn=run_live_mode,
+            logger=log,
+            fail_fn=fail,
+            setup_error_exit_code_fn=setup_error_exit_code,
+            nr_import_error=NR_IMPORT_ERROR,
+            base_dir=pathlib.Path(__file__).resolve().parent,
+            stderr=sys.stderr,
         )
-        if status == 0:
-            log(f"Done in {time.perf_counter() - start:.2f}s", args.verbose, start)
-        return status
     finally:
         stop_py_spy_profile(profile_session)
 
