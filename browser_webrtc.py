@@ -8,7 +8,6 @@ import socket
 import sys
 import threading
 import time
-import wave
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,6 +25,10 @@ from local_ai.slices.voice.shared.transcript_policy import should_suppress_trans
 from local_ai.slices.voice.transcribe_stream.request import TranscribeStreamChunkRequest
 from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunks
 from local_ai.slices.voice.web_ui.audio_decode import try_decode_bytes
+from local_ai.slices.voice.web_ui.capture_store import (
+    append_capture_audio,
+    close_capture_writer,
+)
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
     validate_chunk_config,
@@ -259,7 +262,7 @@ class AudioStreamService:
                     await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
 
                 for chunk in prepared.model_inputs:
-                    out_path = self._append_capture_audio(session, chunk)
+                    out_path = append_capture_audio(session, chunk)
                     if out_path is not None and session.capture_samples == int(chunk.size):
                         await session.queue.put(f"[server] recording WAV capture: {out_path}")
                     session.model_chunks += 1
@@ -326,37 +329,6 @@ class AudioStreamService:
             except asyncio.CancelledError:
                 break
 
-    def _ensure_capture_writer(self, session: SessionState) -> pathlib.Path:
-        if session.capture_writer is None:
-            captures_dir = pathlib.Path.cwd() / "captures"
-            captures_dir.mkdir(parents=True, exist_ok=True)
-            session.capture_path = captures_dir / f"capture_{session.session_id}_{int(time.time())}.wav"
-            writer = wave.open(str(session.capture_path), "wb")
-            writer.setnchannels(1)
-            writer.setsampwidth(2)
-            writer.setframerate(TARGET_SAMPLE_RATE)
-            session.capture_writer = writer
-            session.capture_sample_rate = TARGET_SAMPLE_RATE
-        return session.capture_path
-
-    def _append_capture_audio(self, session: SessionState, audio: np.ndarray) -> pathlib.Path | None:
-        if not session.save_sample or audio.size == 0:
-            return None
-        out_path = self._ensure_capture_writer(session)
-        pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-        session.capture_writer.writeframes(pcm16.tobytes())
-        session.capture_samples += int(audio.size)
-        return out_path
-
-    def _close_capture_writer(self, session: SessionState) -> pathlib.Path | None:
-        if session.capture_writer is None:
-            return None
-        try:
-            session.capture_writer.close()
-        finally:
-            session.capture_writer = None
-        return session.capture_path
-
     async def _cleanup_session(self, session: SessionState) -> None:
         if session.audio_socket is not None:
             try:
@@ -365,7 +337,7 @@ class AudioStreamService:
                 pass
             session.audio_socket = None
 
-        saved_path = self._close_capture_writer(session)
+        saved_path = close_capture_writer(session)
         if saved_path is not None:
             capture_rate = float(session.capture_sample_rate or TARGET_SAMPLE_RATE)
             duration = session.capture_samples / capture_rate
