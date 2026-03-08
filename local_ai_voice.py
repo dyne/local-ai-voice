@@ -11,11 +11,13 @@ import numpy as np
 
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
-from voice_runtime import (
-    DeviceListRequested,
-    PipelineSetupError,
+from local_ai.infrastructure.openvino.whisper import (
     create_whisper_runtime,
     likely_reason_details,
+)
+from local_ai.shared.domain.errors import (
+    DeviceListRequested,
+    PipelineSetupError,
 )
 
 TARGET_SAMPLE_RATE = 16000

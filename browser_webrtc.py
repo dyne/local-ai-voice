@@ -31,7 +31,8 @@ from local_ai_voice import (
     should_suppress_transcript,
     transcribe_chunk,
 )
-from voice_runtime import DeviceListRequested, PipelineSetupError, create_whisper_runtime, likely_reason_details
+from local_ai.infrastructure.openvino.whisper import create_whisper_runtime, likely_reason_details
+from local_ai.shared.domain.errors import DeviceListRequested, PipelineSetupError
 
 DEFAULT_CHUNK_SECONDS = 1.5
 DEFAULT_OVERLAP_SECONDS = 0.0

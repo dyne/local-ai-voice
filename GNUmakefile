@@ -22,7 +22,7 @@ SPEC := $(APP_NAME).spec
 REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av pywebview huggingface_hub[hf_xet]
 OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
 
-.PHONY: all install install-build spec build build-webrtc run run-web run-server clean
+.PHONY: all install install-build spec build build-webrtc run run-web run-server test clean
 
 all: install
 
@@ -71,6 +71,9 @@ run-web:
 
 run-server:
 	$(PYTHON) $(SCRIPT) --server
+
+test:
+	$(PYTHON) -m pytest
 
 clean:
 ifeq ($(OS),Windows_NT)
