@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import av
@@ -33,6 +33,11 @@ from local_ai.slices.voice.web_ui.server_config import (
     validate_chunk_config,
     validate_tls_paths,
 )
+from local_ai.slices.voice.web_ui.session_state import (
+    DEFAULT_AUDIO_BITRATE,
+    SessionState,
+    create_session_state,
+)
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai_voice import (
@@ -44,7 +49,6 @@ from local_ai.shared.domain.errors import DeviceListRequested, PipelineSetupErro
 
 DEFAULT_CHUNK_SECONDS = 1.5
 DEFAULT_OVERLAP_SECONDS = 0.0
-DEFAULT_AUDIO_BITRATE = 48000
 MAX_ENCODED_BUFFER_BYTES = 4 * 1024 * 1024
 UI_PATH = pathlib.Path(__file__).resolve().parent / "web" / "index.html"
 
@@ -74,34 +78,6 @@ class ServerContext:
     verbose: bool
     start_time: float
     infer_lock: asyncio.Lock
-
-
-@dataclass
-class Session:
-    session_id: str
-    queue: asyncio.Queue[str]
-    save_sample: bool
-    silence_detect: bool
-    debug: bool
-    audio_preprocessor: object | None
-    chunk_seconds: float
-    overlap_seconds: float
-    stream_sample_rate: int | None = None
-    mime_type: str | None = None
-    audio_bitrate: int = DEFAULT_AUDIO_BITRATE
-    capture_path: pathlib.Path | None = None
-    capture_writer: wave.Wave_write | None = None
-    capture_sample_rate: int | None = None
-    capture_samples: int = 0
-    audio_socket: WebSocket | None = None
-    encoded_buffer: bytearray = field(default_factory=bytearray)
-    decoded_sample_cursor: int = 0
-    decoded_sample_rate: int | None = None
-    received_messages: int = 0
-    decode_attempts: int = 0
-    decoded_messages: int = 0
-    model_chunks: int = 0
-    debug_messages_sent: int = 0
 
 
 def load_index_html(silence_detect_default: bool, vad_mode_default: int) -> str:
@@ -151,9 +127,9 @@ class AudioStreamService:
     def __init__(self, ctx: ServerContext, index_html: str) -> None:
         self.ctx = ctx
         self.index_html = index_html
-        self.sessions: dict[str, Session] = {}
+        self.sessions: dict[str, SessionState] = {}
 
-    async def _debug(self, session: Session, message: str, limit: int = 12) -> None:
+    async def _debug(self, session: SessionState, message: str, limit: int = 12) -> None:
         if not session.debug:
             return
         if session.debug_messages_sent >= limit:
@@ -197,29 +173,22 @@ class AudioStreamService:
             await self._cleanup_session(self.sessions[payload.session_id])
 
         try:
-            validate_chunk_config(payload.chunk_seconds, payload.overlap_seconds)
+            self.sessions[payload.session_id] = create_session_state(
+                session_id=payload.session_id,
+                save_sample=payload.save_sample,
+                silence_detect=payload.silence_detect,
+                debug=payload.debug,
+                chunk_seconds=payload.chunk_seconds,
+                overlap_seconds=payload.overlap_seconds,
+                mime_type=payload.mime_type,
+                audio_bitrate=payload.audio_bitrate,
+                create_preprocessor=lambda enabled, vad_mode: create_audio_preprocessor(enabled, vad_mode=vad_mode),
+                vad_mode=payload.vad_mode,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if payload.audio_bitrate <= 0:
-            raise HTTPException(status_code=400, detail="audio_bitrate must be > 0")
-
-        try:
-            audio_preprocessor = create_audio_preprocessor(payload.silence_detect, vad_mode=payload.vad_mode)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Audio preprocessing failed: {exc}") from exc
-
-        self.sessions[payload.session_id] = Session(
-            session_id=payload.session_id,
-            queue=asyncio.Queue(maxsize=64),
-            save_sample=payload.save_sample,
-            silence_detect=payload.silence_detect,
-            debug=payload.debug,
-            audio_preprocessor=audio_preprocessor,
-            chunk_seconds=payload.chunk_seconds,
-            overlap_seconds=payload.overlap_seconds,
-            mime_type=payload.mime_type,
-            audio_bitrate=payload.audio_bitrate,
-        )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         await self._debug(
             self.sessions[payload.session_id],
             f"session created mime={payload.mime_type or 'unknown'} bitrate={payload.audio_bitrate} chunk={payload.chunk_seconds:.2f}s overlap={payload.overlap_seconds:.2f}s save_sample={payload.save_sample}",
@@ -373,7 +342,7 @@ class AudioStreamService:
             audio = audio / float(max_value)
         return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
 
-    async def _event_stream(self, session: Session) -> object:
+    async def _event_stream(self, session: SessionState) -> object:
         while True:
             try:
                 line = await asyncio.wait_for(session.queue.get(), timeout=15.0)
@@ -383,7 +352,7 @@ class AudioStreamService:
             except asyncio.CancelledError:
                 break
 
-    def _ensure_capture_writer(self, session: Session) -> pathlib.Path:
+    def _ensure_capture_writer(self, session: SessionState) -> pathlib.Path:
         if session.capture_writer is None:
             captures_dir = pathlib.Path.cwd() / "captures"
             captures_dir.mkdir(parents=True, exist_ok=True)
@@ -396,7 +365,7 @@ class AudioStreamService:
             session.capture_sample_rate = TARGET_SAMPLE_RATE
         return session.capture_path
 
-    def _append_capture_audio(self, session: Session, audio: np.ndarray) -> pathlib.Path | None:
+    def _append_capture_audio(self, session: SessionState, audio: np.ndarray) -> pathlib.Path | None:
         if not session.save_sample or audio.size == 0:
             return None
         out_path = self._ensure_capture_writer(session)
@@ -405,7 +374,7 @@ class AudioStreamService:
         session.capture_samples += int(audio.size)
         return out_path
 
-    def _close_capture_writer(self, session: Session) -> pathlib.Path | None:
+    def _close_capture_writer(self, session: SessionState) -> pathlib.Path | None:
         if session.capture_writer is None:
             return None
         try:
@@ -414,7 +383,7 @@ class AudioStreamService:
             session.capture_writer = None
         return session.capture_path
 
-    async def _cleanup_session(self, session: Session) -> None:
+    async def _cleanup_session(self, session: SessionState) -> None:
         if session.audio_socket is not None:
             try:
                 await session.audio_socket.close()
