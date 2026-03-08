@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import pathlib
-import socket
 import sys
 import threading
 import time
@@ -30,7 +29,7 @@ from local_ai.slices.voice.web_ui.capture_store import (
 )
 from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
-from local_ai.slices.voice.web_ui.launch_helpers import fallback_url, wait_for_server
+from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
 from local_ai.slices.voice.web_ui.session_registry import (
     close_unknown_session,
     replace_existing_session,
@@ -425,19 +424,8 @@ def run_server(args: argparse.Namespace) -> int:
         stop_py_spy_profile(profile_session)
 
 
-def find_free_port(host: str) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        sock.listen(1)
-        return int(sock.getsockname()[1])
-
-
 def _print_fallback_url(args: argparse.Namespace) -> None:
-    print(
-        f"Desktop UI unavailable. Open {fallback_url(host=args.host, port=args.port, tls_certfile=args.tls_certfile)} in a browser.",
-        file=sys.stderr,
-        flush=True,
-    )
+    print(fallback_message(host=args.host, port=args.port, tls_certfile=args.tls_certfile), file=sys.stderr, flush=True)
 
 
 def run_desktop(args: argparse.Namespace) -> int:
