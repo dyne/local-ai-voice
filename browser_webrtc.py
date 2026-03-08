@@ -31,6 +31,7 @@ from local_ai.slices.voice.web_ui.capture_store import (
 from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
+from local_ai.slices.voice.web_ui.runtime_context import create_server_context
 from local_ai.slices.voice.web_ui.session_registry import (
     close_unknown_session,
     replace_existing_session,
@@ -54,7 +55,6 @@ from local_ai_voice import (
     log,
 )
 from local_ai.infrastructure.openvino.whisper import create_whisper_runtime, likely_reason_details
-from local_ai.shared.domain.errors import DeviceListRequested, PipelineSetupError
 
 DEFAULT_CHUNK_SECONDS = 1.5
 DEFAULT_OVERLAP_SECONDS = 0.0
@@ -101,34 +101,15 @@ def load_index_html(silence_detect_default: bool, vad_mode_default: int) -> str:
 
 
 def create_context(args: argparse.Namespace, start_time: float) -> ServerContext:
-    configure_openvino_runtime_env()
-    try:
-        runtime = create_whisper_runtime(
-            args=args,
-            base_dir=pathlib.Path(__file__).resolve().parent,
-            logger=log,
-            verbose=args.verbose,
-            start_time=start_time,
-        )
-    except DeviceListRequested as exc:
-        if not exc.devices:
-            raise RuntimeError("No OpenVINO devices detected.")
-        raise RuntimeError("Devices: " + ", ".join(exc.devices))
-    except PipelineSetupError as exc:
-        raise RuntimeError(f"{exc.reason} {' '.join(exc.details)}")
-
-    return ServerContext(
-        pipe=runtime.pipe,
-        generate_kwargs=runtime.generate_kwargs,
-        selected_device=runtime.selected_device,
-        model_dir=runtime.model_dir,
-        silence_detect_default=args.silence_detect,
-        vad_mode_default=args.vad_mode,
-        chunk_seconds=args.chunk_seconds,
-        overlap_seconds=args.overlap_seconds,
-        verbose=args.verbose,
+    return create_server_context(
+        args=args,
         start_time=start_time,
-        infer_lock=asyncio.Lock(),
+        configure_runtime_env=configure_openvino_runtime_env,
+        create_runtime=create_whisper_runtime,
+        logger=log,
+        base_dir=pathlib.Path(__file__).resolve().parent,
+        context_factory=ServerContext,
+        lock_factory=asyncio.Lock,
     )
 
 
