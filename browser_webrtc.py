@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import pathlib
 import sys
-import threading
 import time
 from dataclasses import dataclass
 
@@ -33,6 +32,7 @@ from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.inference_runner import run_chunk_inference
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
+from local_ai.slices.voice.web_ui.launch_modes import run_desktop_mode, run_server_mode
 from local_ai.slices.voice.web_ui.message_processor import process_audio_message
 from local_ai.slices.voice.web_ui.runtime_context import create_server_context
 from local_ai.slices.voice.web_ui.session_decoder import decode_session_message
@@ -338,36 +338,14 @@ def run_server(args: argparse.Namespace) -> int:
         output_path=args.profile_output,
     )
     try:
-        try:
-            ctx, service, start_time = prepare_server(args)
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 3
-
-        print(f"Using device: {ctx.selected_device}", file=sys.stderr, flush=True)
-        print(f"Using model: {ctx.model_dir}", file=sys.stderr, flush=True)
-        enable_loopback_only_network()
-
-        try:
-            import uvicorn
-        except Exception as exc:
-            print(f"Error: uvicorn is not available: {exc}", file=sys.stderr)
-            return 3
-
-        scheme = "https" if args.tls_certfile is not None else "http"
-        log(f"Starting server on {scheme}://{args.host}:{args.port}", args.verbose, start_time)
-        uvicorn.run(
-            service.build_app(),
-            host=args.host,
-            port=args.port,
-            log_level="info",
-            ssl_certfile=str(args.tls_certfile) if args.tls_certfile is not None else None,
-            ssl_keyfile=str(args.tls_keyfile) if args.tls_keyfile is not None else None,
+        return run_server_mode(
+            args=args,
+            prepare_server_fn=prepare_server,
+            enable_loopback_only_network_fn=enable_loopback_only_network,
+            import_uvicorn_fn=lambda: __import__("uvicorn"),
+            logger=log,
+            stderr=sys.stderr,
         )
-        return 0
     finally:
         stop_py_spy_profile(profile_session)
 
@@ -383,63 +361,20 @@ def run_desktop(args: argparse.Namespace) -> int:
         output_path=args.profile_output,
     )
     try:
-        try:
-            args.host = desktop_host()
-            if args.port == 8000:
-                args.port = find_free_port(args.host)
-            ctx, service, start_time = prepare_server(args)
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 3
-
-        print(f"Using device: {ctx.selected_device}", file=sys.stderr, flush=True)
-        print(f"Using model: {ctx.model_dir}", file=sys.stderr, flush=True)
-
-        try:
-            import uvicorn
-            import webview
-        except Exception as exc:
-            print(f"Desktop UI unavailable: {exc}", file=sys.stderr, flush=True)
-            _print_fallback_url(args)
-            return run_server(args)
-
-        config = uvicorn.Config(
-            service.build_app(),
-            host=args.host,
-            port=args.port,
-            log_level="info",
-            ssl_certfile=str(args.tls_certfile) if args.tls_certfile is not None else None,
-            ssl_keyfile=str(args.tls_keyfile) if args.tls_keyfile is not None else None,
+        return run_desktop_mode(
+            args=args,
+            prepare_server_fn=prepare_server,
+            run_server_fn=run_server,
+            desktop_host_fn=desktop_host,
+            find_free_port_fn=find_free_port,
+            enable_loopback_only_network_fn=enable_loopback_only_network,
+            import_desktop_dependencies_fn=lambda: (__import__("uvicorn"), __import__("webview")),
+            wait_for_server_fn=wait_for_server,
+            logger=log,
+            print_fallback_url_fn=_print_fallback_url,
+            thread_factory=__import__("threading").Thread,
+            stderr=sys.stderr,
         )
-        server = uvicorn.Server(config)
-        server.install_signal_handlers = lambda: None
-
-        server_thread = threading.Thread(target=server.run, daemon=True)
-        server_thread.start()
-        wait_for_server(args.host, args.port)
-        enable_loopback_only_network()
-
-        scheme = "https" if args.tls_certfile is not None else "http"
-        url = f"{scheme}://{args.host}:{args.port}"
-        log(f"Starting desktop UI on {url}", args.verbose, start_time)
-        try:
-            webview.create_window("Local AI Voice", url, width=1280, height=900)
-            webview.start()
-        except Exception as exc:
-            print(f"Desktop UI unavailable: {exc}", file=sys.stderr, flush=True)
-            _print_fallback_url(args)
-            server.should_exit = True
-            server_thread.join(timeout=10.0)
-            return run_server(args)
-
-        server.should_exit = True
-        server_thread.join(timeout=10.0)
-        if server.force_exit:
-            return 3
-        return 0
     finally:
         stop_py_spy_profile(profile_session)
 
