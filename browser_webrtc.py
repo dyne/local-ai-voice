@@ -27,6 +27,12 @@ from local_ai.slices.voice.transcribe_stream.buffer_decoder import decode_audio_
 from local_ai.slices.voice.shared.transcript_policy import should_suppress_transcript, transcribe_chunk
 from local_ai.slices.voice.transcribe_stream.request import TranscribeStreamChunkRequest
 from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunks
+from local_ai.slices.voice.web_ui.server_config import (
+    desktop_host,
+    mime_type_to_av_format,
+    validate_chunk_config,
+    validate_tls_paths,
+)
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai_voice import (
@@ -107,26 +113,6 @@ def load_index_html(silence_detect_default: bool, vad_mode_default: int) -> str:
             .replace("__VAD_MODE_DEFAULT__", str(vad_mode_default))
         )
     return "<!doctype html><html><body><h3>UI file missing</h3></body></html>"
-
-
-def validate_chunk_config(chunk_seconds: float, overlap_seconds: float) -> None:
-    if chunk_seconds <= 0:
-        raise ValueError("chunk_seconds must be > 0")
-    if overlap_seconds < 0:
-        raise ValueError("overlap_seconds must be >= 0")
-    if overlap_seconds >= chunk_seconds:
-        raise ValueError("overlap_seconds must be smaller than chunk_seconds")
-
-
-def mime_type_to_av_format(mime_type: str | None) -> str | None:
-    if not mime_type:
-        return None
-    lowered = mime_type.lower()
-    if "ogg" in lowered:
-        return "ogg"
-    if "webm" in lowered:
-        return "webm"
-    return None
 
 
 def create_context(args: argparse.Namespace, start_time: float) -> ServerContext:
@@ -491,17 +477,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def validate_tls_args(args: argparse.Namespace) -> None:
-    if (args.tls_certfile is None) != (args.tls_keyfile is None):
-        raise ValueError("--tls-certfile and --tls-keyfile must be provided together.")
-    if args.tls_certfile is not None and not args.tls_certfile.exists():
-        raise ValueError(f"TLS certificate file not found: {args.tls_certfile}")
-    if args.tls_keyfile is not None and not args.tls_keyfile.exists():
-        raise ValueError(f"TLS key file not found: {args.tls_keyfile}")
-
-
 def prepare_server(args: argparse.Namespace) -> tuple[ServerContext, AudioStreamService, float]:
-    validate_tls_args(args)
+    validate_tls_paths(args.tls_certfile, args.tls_keyfile)
     validate_chunk_config(args.chunk_seconds, args.overlap_seconds)
     start_time = time.perf_counter()
     ctx = create_context(args, start_time)
@@ -551,10 +528,6 @@ def run_server(args: argparse.Namespace) -> int:
         return 0
     finally:
         stop_py_spy_profile(profile_session)
-
-
-def desktop_host() -> str:
-    return "127.0.0.1"
 
 
 def find_free_port(host: str) -> int:
