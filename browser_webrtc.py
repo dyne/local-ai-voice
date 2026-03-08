@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import pathlib
 import socket
 import sys
@@ -21,15 +20,14 @@ from pydantic import BaseModel
 from local_ai.slices.voice.shared.audio_processing import (
     TARGET_SAMPLE_RATE,
     create_audio_preprocessor,
-    normalize_audio_format,
 )
 from local_ai.slices.voice.transcribe_stream.buffer_decoder import decode_audio_message
 from local_ai.slices.voice.shared.transcript_policy import should_suppress_transcript, transcribe_chunk
 from local_ai.slices.voice.transcribe_stream.request import TranscribeStreamChunkRequest
 from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunks
+from local_ai.slices.voice.web_ui.audio_decode import try_decode_bytes
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
-    mime_type_to_av_format,
     validate_chunk_config,
     validate_tls_paths,
 )
@@ -316,31 +314,7 @@ class AudioStreamService:
         return decoded.audio, decoded.sample_rate
 
     def _try_decode_bytes(self, payload: bytes, mime_type: str | None) -> tuple[np.ndarray, int] | None:
-        format_hint = mime_type_to_av_format(mime_type)
-        with av.open(io.BytesIO(payload), format=format_hint) as container:
-            decoded_frames: list[np.ndarray] = []
-            sample_rate: int | None = None
-            for frame in container.decode(audio=0):
-                mono = self._decode_audio_frame(frame)
-                if mono.size == 0:
-                    continue
-                decoded_frames.append(mono)
-                sample_rate = int(frame.sample_rate)
-        if not decoded_frames or sample_rate is None:
-            return None
-        return np.concatenate(decoded_frames), sample_rate
-
-    def _decode_audio_frame(self, frame: av.AudioFrame) -> np.ndarray:
-        array = frame.to_ndarray()
-        if array.ndim == 2:
-            audio = array.mean(axis=0)
-        else:
-            audio = array
-        audio = normalize_audio_format(audio)
-        if np.issubdtype(array.dtype, np.integer):
-            max_value = max(abs(np.iinfo(array.dtype).min), np.iinfo(array.dtype).max)
-            audio = audio / float(max_value)
-        return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+        return try_decode_bytes(payload=payload, mime_type=mime_type)
 
     async def _event_stream(self, session: SessionState) -> object:
         while True:
