@@ -20,6 +20,7 @@ from local_ai.slices.voice.transcribe_file.request import TranscribeFileRequest
 from local_ai.slices.voice.transcribe_file.service import execute_transcribe_file
 from local_ai.slices.voice.transcribe_live.request import TranscribeLiveRequest
 from local_ai.slices.voice.transcribe_live.service import execute_transcribe_live
+from local_ai.slices.voice.entrypoint import dispatch_voice_entry
 from local_ai.infrastructure.openvino.runtime_env import configure_openvino_runtime_env
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
@@ -244,46 +245,35 @@ def run_transcribe(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if any(arg in {"-h", "--help"} for arg in raw_argv) and "--web" not in raw_argv and "--server" not in raw_argv:
-        build_transcribe_parser(include_web_flag=True).parse_args(raw_argv)
-        return 0
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--web",
-        action="store_true",
-        help="Open the desktop web UI instead of file/live transcription.",
+    
+    def parse_dispatch_args(current_argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument(
+            "--web",
+            action="store_true",
+            help="Open the desktop web UI instead of file/live transcription.",
+        )
+        parser.add_argument(
+            "--server",
+            action="store_true",
+            help="Run the browser audio streaming transcription server without the desktop wrapper.",
+        )
+        parser.add_argument(
+            "--cli",
+            action="store_true",
+            help="Force the non-web CLI mode for file or live microphone transcription.",
+        )
+        return parser.parse_known_args(current_argv)
+
+    return dispatch_voice_entry(
+        raw_argv=raw_argv,
+        build_help_parser_fn=lambda: build_transcribe_parser(include_web_flag=True),
+        parse_dispatch_args_fn=parse_dispatch_args,
+        run_transcribe_fn=run_transcribe,
+        parse_browser_args_fn=lambda remaining: __import__("browser_webrtc").parse_args(remaining),
+        run_server_fn=lambda args: __import__("browser_webrtc").run_server(args),
+        run_desktop_fn=lambda args: __import__("browser_webrtc").run_desktop(args),
     )
-    parser.add_argument(
-        "--server",
-        action="store_true",
-        help="Run the browser audio streaming transcription server without the desktop wrapper.",
-    )
-    parser.add_argument(
-        "--cli",
-        action="store_true",
-        help="Force the non-web CLI mode for file or live microphone transcription.",
-    )
-    args, remaining = parser.parse_known_args(raw_argv)
-
-    if args.server:
-        import browser_webrtc
-
-        return browser_webrtc.run_server(browser_webrtc.parse_args(remaining))
-    if args.web:
-        import browser_webrtc
-
-        return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
-    if args.cli:
-        return run_transcribe(remaining)
-    if any(not arg.startswith("-") for arg in remaining):
-        return run_transcribe(remaining)
-    if remaining:
-        import browser_webrtc
-
-        return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
-    import browser_webrtc
-
-    return browser_webrtc.run_desktop(browser_webrtc.parse_args(remaining))
 
 
 if __name__ == "__main__":
