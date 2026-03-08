@@ -43,8 +43,11 @@ spec: install-build
 		--hidden-import av \
 		--hidden-import noisereduce \
 		--hidden-import webrtcvad \
+		--hidden-import uvicorn \
 		--hidden-import webview \
 		--hidden-import hf_xet \
+		--collect-submodules uvicorn \
+		--collect-submodules websockets \
 		--additional-hooks-dir hooks \
 		--collect-binaries openvino \
 		--collect-data openvino \
