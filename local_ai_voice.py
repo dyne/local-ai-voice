@@ -526,7 +526,6 @@ def build_transcribe_parser(*, include_web_flag: bool = False) -> argparse.Argum
     )
     parser.add_argument(
         "--model",
-        type=pathlib.Path,
         default=None,
         help="Optional OpenVINO model directory or Hugging Face repo id. If omitted, default OpenVINO model is auto-downloaded.",
     )

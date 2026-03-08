@@ -73,4 +73,8 @@ run-server:
 	$(PYTHON) $(SCRIPT) --server
 
 clean:
+ifeq ($(OS),Windows_NT)
+	-powershell -NoProfile -Command "Remove-Item -Recurse -Force build,dist,__pycache__ -ErrorAction SilentlyContinue; Remove-Item -Force *.spec -ErrorAction SilentlyContinue"
+else
 	$(RM) -r build dist __pycache__ *.spec
+endif

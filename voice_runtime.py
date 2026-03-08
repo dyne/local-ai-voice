@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -16,6 +17,18 @@ DEFAULT_MODEL_REPO_FOR_DEVICE = {
     "GPU": "OpenVINO/whisper-tiny-fp16-ov",
     "CPU": "OpenVINO/whisper-tiny-fp16-ov",
 }
+REQUIRED_OPENVINO_WHISPER_FILES = (
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "openvino_tokenizer.xml",
+    "openvino_tokenizer.bin",
+    "openvino_detokenizer.xml",
+    "openvino_detokenizer.bin",
+    "config.json",
+    "generation_config.json",
+)
 
 
 @dataclass
@@ -103,7 +116,11 @@ def likely_reason_details(exc: Exception) -> list[str]:
 
 
 def is_openvino_whisper_dir(model_dir: pathlib.Path) -> bool:
-    return (model_dir / "openvino_encoder_model.xml").exists()
+    return not missing_openvino_whisper_files(model_dir)
+
+
+def missing_openvino_whisper_files(model_dir: pathlib.Path) -> list[str]:
+    return [name for name in REQUIRED_OPENVINO_WHISPER_FILES if not (model_dir / name).exists()]
 
 
 def _to_path(value: object) -> pathlib.Path:
@@ -131,6 +148,44 @@ def _parse_hf_repo_id(value: str) -> str | None:
     return f"{parts[0]}/{parts[1]}"
 
 
+def _hf_cache_root() -> pathlib.Path:
+    explicit = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or (pathlib.Path(os.environ["HF_HOME"]) / "hub" if os.environ.get("HF_HOME") else None)
+    )
+    if explicit:
+        return pathlib.Path(explicit)
+    return pathlib.Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _resolve_cached_openvino_model(repo_id: str, hf_token: str | None) -> pathlib.Path | None:
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        snapshot_download = None
+
+    if snapshot_download is not None:
+        try:
+            local_snapshot = pathlib.Path(snapshot_download(repo_id=repo_id, token=hf_token, local_files_only=True))
+        except Exception:
+            local_snapshot = None
+        if local_snapshot is not None and is_openvino_whisper_dir(local_snapshot):
+            return local_snapshot
+
+    org, name = repo_id.split("/", 1)
+    repo_cache_dir = _hf_cache_root() / f"models--{org}--{name}"
+    snapshots_dir = repo_cache_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+
+    candidates = sorted((path for path in snapshots_dir.iterdir() if path.is_dir()), key=lambda path: path.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        if is_openvino_whisper_dir(candidate):
+            return candidate
+    return None
+
+
 def _download_openvino_model(repo_id: str) -> pathlib.Path:
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     try:
@@ -142,28 +197,39 @@ def _download_openvino_model(repo_id: str) -> pathlib.Path:
         ) from exc
 
     # Reuse the shared Hugging Face cache first (no network).
-    try:
-        local_snapshot = snapshot_download(repo_id=repo_id, token=hf_token, local_files_only=True)
-        local_model_dir = pathlib.Path(local_snapshot)
-        if is_openvino_whisper_dir(local_model_dir):
-            return local_model_dir
-    except Exception:
-        pass
+    cached_model_dir = _resolve_cached_openvino_model(repo_id, hf_token)
+    if cached_model_dir is not None:
+        return cached_model_dir
 
     try:
-        downloaded = snapshot_download(repo_id=repo_id, token=hf_token)
+        downloaded = pathlib.Path(snapshot_download(repo_id=repo_id, token=hf_token))
     except Exception as exc:
         raise PipelineSetupError(
             f"Failed to download model: {repo_id}",
             [f"Runtime error: {exc}", "Check network access, model repository name, and HF_TOKEN if authentication is required."],
         ) from exc
-    model_dir = pathlib.Path(downloaded)
-    if not is_openvino_whisper_dir(model_dir):
+
+    # In frozen builds, the freshly downloaded snapshot can be visible before all files are
+    # immediately observable at the returned path. Re-resolve through the cache and wait briefly.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        cached_model_dir = _resolve_cached_openvino_model(repo_id, hf_token)
+        if cached_model_dir is not None:
+            return cached_model_dir
+        if is_openvino_whisper_dir(downloaded):
+            return downloaded
+        time.sleep(0.1)
+
+    missing_files = missing_openvino_whisper_files(downloaded)
+    if missing_files:
         raise PipelineSetupError(
             f"Downloaded model is not an OpenVINO Whisper export: {repo_id}",
-            ["Expected openvino_encoder_model.xml in model directory."],
+            [
+                f"Downloaded path: {downloaded}",
+                "Missing required files: " + ", ".join(missing_files),
+            ],
         )
-    return model_dir
+    return downloaded
 
 
 def resolve_model_dir(
@@ -174,16 +240,21 @@ def resolve_model_dir(
     offline: bool = False,
 ) -> pathlib.Path:
     default_repo = DEFAULT_MODEL_REPO_FOR_DEVICE[selected_device]
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     if model_arg is None:
         bundled = base_dir / DEFAULT_MODEL_FOR_DEVICE[selected_device]
         if is_openvino_whisper_dir(bundled):
             return bundled
+        cached = _resolve_cached_openvino_model(default_repo, hf_token)
+        if cached is not None:
+            return cached
         if offline:
             raise PipelineSetupError(
                 "Model download required but offline mode is enabled.",
                 [
                     f"Selected device: {selected_device}",
                     f"Expected local model: {bundled}",
+                    f"Checked Hugging Face cache for: {default_repo}",
                     f"Disable --offline to download default model: {default_repo}",
                 ],
             )
@@ -193,19 +264,24 @@ def resolve_model_dir(
     model_path = _to_path(model_arg)
     if model_path.exists():
         if not is_openvino_whisper_dir(model_path):
+            missing_files = missing_openvino_whisper_files(model_path)
             raise PipelineSetupError(
                 f"Model directory is not an OpenVINO Whisper export: {model_path}",
-                ["Expected openvino_encoder_model.xml in model directory."],
+                ["Missing required files: " + ", ".join(missing_files)],
             )
         return model_path
 
     repo_id = _parse_hf_repo_id(model_text)
     if repo_id is not None:
+        cached = _resolve_cached_openvino_model(repo_id, hf_token)
+        if cached is not None:
+            return cached
         if offline:
             raise PipelineSetupError(
                 "Model download required but offline mode is enabled.",
                 [
                     f"Requested repo: {repo_id}",
+                    "The requested repo was not found in the shared Hugging Face cache.",
                     "Disable --offline to download from Hugging Face.",
                 ],
             )
