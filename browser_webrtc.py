@@ -30,6 +30,7 @@ from local_ai.slices.voice.web_ui.capture_store import (
 )
 from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
+from local_ai.slices.voice.web_ui.inference_runner import run_chunk_inference
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
 from local_ai.slices.voice.web_ui.runtime_context import create_server_context
 from local_ai.slices.voice.web_ui.session_decoder import decode_session_message
@@ -244,15 +245,22 @@ class AudioStreamService:
                     if session.model_chunks <= 4:
                         await self._debug(session, f"model chunk #{session.model_chunks} samples={chunk.size} sample_rate={TARGET_SAMPLE_RATE}")
 
-                    async with self.ctx.infer_lock:
-                        try:
-                            text = await asyncio.to_thread(transcribe_chunk, self.ctx.pipe, chunk, self.ctx.generate_kwargs)
-                        except Exception as exc:
-                            details = likely_reason_details(exc)
-                            await session.queue.put(f"[server error] Live transcription failed: {details[0]}")
-                            continue
-                    if text and not should_suppress_transcript(text, session.audio_preprocessor):
-                        await session.queue.put(text)
+                    inference = await run_chunk_inference(
+                        chunk=chunk,
+                        pipe=self.ctx.pipe,
+                        generate_kwargs=self.ctx.generate_kwargs,
+                        audio_preprocessor=session.audio_preprocessor,
+                        infer_lock=self.ctx.infer_lock,
+                        transcribe_fn=transcribe_chunk,
+                        should_suppress_fn=should_suppress_transcript,
+                        likely_reason_details_fn=likely_reason_details,
+                        to_thread_fn=asyncio.to_thread,
+                    )
+                    if inference.error is not None:
+                        await session.queue.put(inference.error)
+                        continue
+                    if inference.text is not None:
+                        await session.queue.put(inference.text)
         except WebSocketDisconnect:
             pass
         except Exception as exc:
