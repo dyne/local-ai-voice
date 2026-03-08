@@ -12,9 +12,10 @@ from dataclasses import dataclass
 import numpy as np
 import av
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from local_ai.slices.voice.web_ui.app_factory import build_browser_app
 from local_ai.slices.voice.shared.audio_processing import (
     TARGET_SAMPLE_RATE,
     create_audio_preprocessor,
@@ -146,35 +147,25 @@ class AudioStreamService:
         await session.queue.put(f"[debug] {message}")
 
     def build_app(self) -> FastAPI:
-        app = FastAPI(title="Browser Mic Transcriber")
-
-        @app.get("/", response_class=HTMLResponse)
-        async def index() -> str:
-            return self.index_html
-
-        @app.post("/session")
-        async def create_session(payload: SessionConfig) -> JSONResponse:
-            return await self._create_session(payload)
-
-        @app.websocket("/audio/{session_id}")
-        async def audio(session_id: str, websocket: WebSocket) -> None:
-            await self._handle_audio_socket(session_id, websocket)
-
-        @app.get("/events/{session_id}")
         async def events(session_id: str) -> StreamingResponse:
             session = self.sessions.get(session_id)
             if session is None:
                 raise HTTPException(status_code=404, detail="Unknown session")
             return StreamingResponse(self._event_stream(session), media_type="text/event-stream")
 
-        @app.delete("/session/{session_id}")
         async def close_session(session_id: str) -> JSONResponse:
             session = self.sessions.get(session_id)
             if session is not None:
                 await self._cleanup_session(session)
             return JSONResponse({"ok": True})
 
-        return app
+        return build_browser_app(
+            index_html=self.index_html,
+            create_session_handler=self._create_session,
+            audio_handler=self._handle_audio_socket,
+            events_handler=events,
+            close_session_handler=close_session,
+        )
 
     async def _create_session(self, payload: SessionConfig) -> JSONResponse:
         await replace_existing_session(payload.session_id, self.sessions, self._cleanup_session)
