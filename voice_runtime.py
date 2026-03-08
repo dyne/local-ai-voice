@@ -112,14 +112,23 @@ def _to_path(value: object) -> pathlib.Path:
     return pathlib.Path(str(value))
 
 
-def _looks_like_hf_repo_id(value: str) -> bool:
+def _parse_hf_repo_id(value: str) -> str | None:
     text = value.strip()
     if not text or text.startswith("."):
-        return False
-    candidate = pathlib.Path(text)
+        return None
+    candidate: pathlib.PurePath
+    if "\\" in text:
+        candidate = pathlib.PureWindowsPath(text)
+    else:
+        candidate = pathlib.PurePosixPath(text)
     if candidate.is_absolute():
-        return False
-    return text.count("/") == 1 and "\\" not in text and " " not in text
+        return None
+    parts = [part for part in candidate.parts if part not in {"", "."}]
+    if len(parts) != 2:
+        return None
+    if any(part in {".."} or " " in part for part in parts):
+        return None
+    return f"{parts[0]}/{parts[1]}"
 
 
 def _download_openvino_model(repo_id: str) -> pathlib.Path:
@@ -190,16 +199,17 @@ def resolve_model_dir(
             )
         return model_path
 
-    if _looks_like_hf_repo_id(model_text):
+    repo_id = _parse_hf_repo_id(model_text)
+    if repo_id is not None:
         if offline:
             raise PipelineSetupError(
                 "Model download required but offline mode is enabled.",
                 [
-                    f"Requested repo: {model_text}",
+                    f"Requested repo: {repo_id}",
                     "Disable --offline to download from Hugging Face.",
                 ],
             )
-        return _download_openvino_model(model_text)
+        return _download_openvino_model(repo_id)
 
     if offline:
         raise PipelineSetupError(
