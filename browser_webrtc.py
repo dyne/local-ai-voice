@@ -31,6 +31,11 @@ from local_ai.slices.voice.web_ui.capture_store import (
 )
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_url, wait_for_server
+from local_ai.slices.voice.web_ui.session_registry import (
+    close_unknown_session,
+    replace_existing_session,
+    reset_existing_audio_socket_session,
+)
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
     validate_chunk_config,
@@ -172,8 +177,7 @@ class AudioStreamService:
         return app
 
     async def _create_session(self, payload: SessionConfig) -> JSONResponse:
-        if payload.session_id in self.sessions:
-            await self._cleanup_session(self.sessions[payload.session_id])
+        await replace_existing_session(payload.session_id, self.sessions, self._cleanup_session)
 
         try:
             self.sessions[payload.session_id] = create_session_state(
@@ -200,16 +204,12 @@ class AudioStreamService:
 
     async def _handle_audio_socket(self, session_id: str, websocket: WebSocket) -> None:
         session = self.sessions.get(session_id)
-        if session is None:
-            await websocket.close(code=4404, reason="Unknown session")
+        if await close_unknown_session(session, websocket):
             return
 
-        if session.audio_socket is not None:
-            await self._cleanup_session(session)
-            session = self.sessions.get(session_id)
-            if session is None:
-                await websocket.close(code=4409, reason="Session reset")
-                return
+        session = await reset_existing_audio_socket_session(session_id, session, self.sessions, self._cleanup_session, websocket)
+        if session is None:
+            return
 
         await websocket.accept()
         session.audio_socket = websocket
