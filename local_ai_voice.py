@@ -518,7 +518,12 @@ def build_transcribe_parser(*, include_web_flag: bool = False) -> argparse.Argum
         "--model",
         type=pathlib.Path,
         default=None,
-        help="Optional model directory. Defaults: NPU->whisper-base.en-int8-ov, GPU/CPU->whisper-tiny-fp16-ov.",
+        help="Optional OpenVINO model directory or Hugging Face repo id. If omitted, default OpenVINO model is auto-downloaded.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable model downloads. Fail if required model is not available locally.",
     )
     parser.add_argument("--language", default=None, help="Optional language token like <|en|>.")
     parser.add_argument("--task", default=None, choices=["transcribe", "translate"], help="Optional Whisper task.")
@@ -593,6 +598,10 @@ def run_transcribe(argv: list[str] | None = None) -> int:
         except PipelineSetupError as exc:
             return fail(exc.reason, exc.details, exit_code=setup_error_exit_code(exc.reason))
 
+        print(f"Using device: {runtime.selected_device}", file=sys.stderr, flush=True)
+        print(f"Using model: {runtime.model_dir}", file=sys.stderr, flush=True)
+        enable_loopback_only_network()
+
         pipe = runtime.pipe
         try:
             audio_preprocessor = create_audio_preprocessor(
@@ -619,7 +628,6 @@ def run_transcribe(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    enable_loopback_only_network()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if any(arg in {"-h", "--help"} for arg in raw_argv) and "--web" not in raw_argv:
         build_transcribe_parser(include_web_flag=True).parse_args(raw_argv)

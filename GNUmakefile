@@ -19,7 +19,7 @@ PIP := $(PYTHON) -m pip
 SCRIPT := local-ai-voice.py
 APP_NAME := local-ai-voice
 SPEC := $(APP_NAME).spec
-REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av huggingface_hub[cli]
+REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av huggingface_hub[hf_xet]
 OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
 
 .PHONY: all install install-build spec build build-webrtc run run-web clean

@@ -54,6 +54,8 @@ class SessionConfig(BaseModel):
 class ServerContext:
     pipe: object
     generate_kwargs: dict[str, object]
+    selected_device: str
+    model_dir: pathlib.Path
     silence_detect_default: bool
     vad_mode_default: int
     chunk_seconds: float
@@ -142,6 +144,8 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
     return ServerContext(
         pipe=runtime.pipe,
         generate_kwargs=runtime.generate_kwargs,
+        selected_device=runtime.selected_device,
+        model_dir=runtime.model_dir,
         silence_detect_default=args.silence_detect,
         vad_mode_default=args.vad_mode,
         chunk_seconds=args.chunk_seconds,
@@ -462,7 +466,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model",
         type=pathlib.Path,
         default=None,
-        help="Optional model directory. Defaults: NPU->whisper-base.en-int8-ov, GPU/CPU->whisper-tiny-fp16-ov.",
+        help="Optional OpenVINO model directory or Hugging Face repo id. If omitted, default OpenVINO model is auto-downloaded.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable model downloads. Fail if required model is not available locally.",
     )
     parser.add_argument("--language", default=None, help="Optional language token like <|en|>.")
     parser.add_argument("--task", default=None, choices=["transcribe", "translate"], help="Optional Whisper task.")
@@ -500,7 +509,6 @@ def validate_tls_args(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    enable_loopback_only_network()
     args = parse_args(argv)
     profile_session = start_py_spy_profile(
         enabled=args.profile,
@@ -521,6 +529,9 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 3
+        print(f"Using device: {ctx.selected_device}", file=sys.stderr, flush=True)
+        print(f"Using model: {ctx.model_dir}", file=sys.stderr, flush=True)
+        enable_loopback_only_network()
 
         try:
             import uvicorn
