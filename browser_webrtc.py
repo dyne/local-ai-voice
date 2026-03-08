@@ -52,6 +52,7 @@ from local_ai.slices.voice.web_ui.session_state import (
     SessionState,
     create_session_state,
 )
+from local_ai.slices.voice.web_ui.socket_loop import handle_audio_socket_connection
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai_voice import (
@@ -179,75 +180,53 @@ class AudioStreamService:
         return JSONResponse({"ok": True})
 
     async def _handle_audio_socket(self, session_id: str, websocket: WebSocket) -> None:
-        session = self.sessions.get(session_id)
-        if await close_unknown_session(session, websocket):
-            return
+        async def infer_for_chunk(*, chunk: np.ndarray, audio_preprocessor: object | None) -> object:
+            return await run_chunk_inference(
+                chunk=chunk,
+                pipe=self.ctx.pipe,
+                generate_kwargs=self.ctx.generate_kwargs,
+                audio_preprocessor=audio_preprocessor,
+                infer_lock=self.ctx.infer_lock,
+                transcribe_fn=transcribe_chunk,
+                should_suppress_fn=should_suppress_transcript,
+                likely_reason_details_fn=likely_reason_details,
+                to_thread_fn=asyncio.to_thread,
+            )
 
-        session = await reset_existing_audio_socket_session(session_id, session, self.sessions, self._cleanup_session, websocket)
-        if session is None:
-            return
+        async def process_chunks(*, session: SessionState, chunks: list[np.ndarray]) -> None:
+            await process_prepared_chunks(
+                session=session,
+                chunks=chunks,
+                target_sample_rate=TARGET_SAMPLE_RATE,
+                append_capture_audio_fn=append_capture_audio,
+                run_chunk_inference_fn=infer_for_chunk,
+                debug_fn=self._debug,
+            )
 
-        await websocket.accept()
-        session.audio_socket = websocket
-        buffered = np.asarray([], dtype=np.float32)
-        await self._debug(session, "audio websocket connected")
+        async def process_message(*, session: SessionState, message: dict[str, object], buffered_audio: np.ndarray) -> object:
+            return await process_audio_message(
+                session=session,
+                message=message,
+                buffered_audio=buffered_audio,
+                verbose=self.ctx.verbose,
+                start_time=self.ctx.start_time,
+                logger=log,
+                debug_fn=self._debug,
+                decode_audio_message_fn=self._decode_audio_message,
+                prepare_stream_chunks_fn=prepare_stream_chunks,
+                process_prepared_chunks_fn=process_chunks,
+                cleanup_session_fn=self._cleanup_session,
+            )
 
-        try:
-            while True:
-                message = await websocket.receive()
-                session.received_messages += 1
-                raw = message.get("bytes")
-                if session.received_messages <= 4:
-                    size = len(raw) if raw else 0
-                    await self._debug(session, f"received blob #{session.received_messages} bytes={size}")
-                async def infer_for_chunk(*, chunk: np.ndarray, audio_preprocessor: object | None) -> object:
-                    return await run_chunk_inference(
-                        chunk=chunk,
-                        pipe=self.ctx.pipe,
-                        generate_kwargs=self.ctx.generate_kwargs,
-                        audio_preprocessor=audio_preprocessor,
-                        infer_lock=self.ctx.infer_lock,
-                        transcribe_fn=transcribe_chunk,
-                        should_suppress_fn=should_suppress_transcript,
-                        likely_reason_details_fn=likely_reason_details,
-                        to_thread_fn=asyncio.to_thread,
-                    )
-
-                async def process_chunks(*, session: SessionState, chunks: list[np.ndarray]) -> None:
-                    await process_prepared_chunks(
-                        session=session,
-                        chunks=chunks,
-                        target_sample_rate=TARGET_SAMPLE_RATE,
-                        append_capture_audio_fn=append_capture_audio,
-                        run_chunk_inference_fn=infer_for_chunk,
-                        debug_fn=self._debug,
-                    )
-
-                result = await process_audio_message(
-                    session=session,
-                    message=message,
-                    buffered_audio=buffered,
-                    verbose=self.ctx.verbose,
-                    start_time=self.ctx.start_time,
-                    logger=log,
-                    debug_fn=self._debug,
-                    decode_audio_message_fn=self._decode_audio_message,
-                    prepare_stream_chunks_fn=prepare_stream_chunks,
-                    process_prepared_chunks_fn=process_chunks,
-                    cleanup_session_fn=self._cleanup_session,
-                )
-                buffered = result.buffered_audio
-                if result.stop:
-                    return
-        except WebSocketDisconnect:
-            pass
-        except Exception as exc:
-            try:
-                await session.queue.put(f"[server error] Audio stream failed: {exc}")
-            except Exception:
-                pass
-        finally:
-            await self._cleanup_session(session)
+        await handle_audio_socket_connection(
+            session_id=session_id,
+            websocket=websocket,
+            sessions=self.sessions,
+            cleanup_session_fn=self._cleanup_session,
+            debug_fn=self._debug,
+            process_message_fn=process_message,
+            websocket_disconnect_type=WebSocketDisconnect,
+        )
 
     def _decode_audio_message(self, session: Session, message: dict[str, object]) -> tuple[np.ndarray, int] | None:
         return decode_session_message(
