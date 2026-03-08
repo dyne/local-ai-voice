@@ -23,6 +23,7 @@ from local_ai.slices.voice.shared.audio_processing import (
     create_audio_preprocessor,
     normalize_audio_format,
 )
+from local_ai.slices.voice.transcribe_stream.buffer_decoder import decode_audio_message
 from local_ai.slices.voice.shared.transcript_policy import should_suppress_transcript, transcribe_chunk
 from local_ai.slices.voice.transcribe_stream.request import TranscribeStreamChunkRequest
 from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunks
@@ -333,32 +334,31 @@ class AudioStreamService:
 
     def _decode_audio_message(self, session: Session, message: dict[str, object]) -> tuple[np.ndarray, int] | None:
         raw = message.get("bytes")
-        if not raw:
-            return None
-        session.decode_attempts += 1
-        session.encoded_buffer.extend(raw)
+        if raw:
+            session.decode_attempts += 1
         try:
-            decoded = self._try_decode_bytes(bytes(session.encoded_buffer), session.mime_type)
-        except av.error.InvalidDataError:
-            if len(session.encoded_buffer) > MAX_ENCODED_BUFFER_BYTES:
-                session.encoded_buffer.clear()
-                session.decoded_sample_cursor = 0
-                session.decoded_sample_rate = None
-                raise RuntimeError("Encoded audio buffer overflow; browser stream is not decodable.")
-            return None
-        if decoded is None:
-            return None
-        audio, sample_rate = decoded
-        if session.decoded_sample_rate is not None and session.decoded_sample_rate != sample_rate:
+            decoded = decode_audio_message(
+                raw=raw if isinstance(raw, (bytes, bytearray)) else None,
+                encoded_buffer=session.encoded_buffer,
+                decoded_sample_cursor=session.decoded_sample_cursor,
+                decoded_sample_rate=session.decoded_sample_rate,
+                mime_type=session.mime_type,
+                max_encoded_buffer_bytes=MAX_ENCODED_BUFFER_BYTES,
+                decode_payload=self._try_decode_bytes,
+                invalid_data_error_type=av.error.InvalidDataError,
+            )
+        except RuntimeError:
+            session.encoded_buffer.clear()
             session.decoded_sample_cursor = 0
-        session.decoded_sample_rate = sample_rate
-        if session.decoded_sample_cursor > audio.size:
-            session.decoded_sample_cursor = 0
-        new_audio = audio[session.decoded_sample_cursor:]
-        session.decoded_sample_cursor = int(audio.size)
-        if new_audio.size == 0:
+            session.decoded_sample_rate = None
+            raise
+
+        session.encoded_buffer = decoded.encoded_buffer
+        session.decoded_sample_cursor = decoded.decoded_sample_cursor
+        session.decoded_sample_rate = decoded.decoded_sample_rate
+        if decoded.audio is None or decoded.sample_rate is None:
             return None
-        return new_audio, sample_rate
+        return decoded.audio, decoded.sample_rate
 
     def _try_decode_bytes(self, payload: bytes, mime_type: str | None) -> tuple[np.ndarray, int] | None:
         format_hint = mime_type_to_av_format(mime_type)
