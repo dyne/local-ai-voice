@@ -211,15 +211,13 @@ def resolve_model_dir(
             )
         return _download_openvino_model(repo_id)
 
-    if offline:
-        raise PipelineSetupError(
-            "Model download required but offline mode is enabled.",
-            [
-                f"Missing local model path: {model_path}",
-                f"Disable --offline to download default model: {default_repo}",
-            ],
-        )
-    return _download_openvino_model(default_repo)
+    raise PipelineSetupError(
+        f"Model directory not found: {model_path}",
+        [
+            "If this is a local path, verify it exists and contains openvino_encoder_model.xml.",
+            "If this is a Hugging Face repo id, use the form org/name (for example OpenVINO/whisper-tiny-fp16-ov).",
+        ],
+    )
 
 
 def create_whisper_runtime(
