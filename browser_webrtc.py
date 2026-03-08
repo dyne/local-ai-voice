@@ -35,6 +35,7 @@ from local_ai.slices.voice.web_ui.session_registry import (
     replace_existing_session,
     reset_existing_audio_socket_session,
 )
+from local_ai.slices.voice.web_ui.server_bootstrap import prepare_server_components
 from local_ai.slices.voice.web_ui.server_config import (
     desktop_host,
     validate_chunk_config,
@@ -372,13 +373,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def prepare_server(args: argparse.Namespace) -> tuple[ServerContext, AudioStreamService, float]:
-    validate_tls_paths(args.tls_certfile, args.tls_keyfile)
-    validate_chunk_config(args.chunk_seconds, args.overlap_seconds)
-    start_time = time.perf_counter()
-    ctx = create_context(args, start_time)
-    service = AudioStreamService(
-        ctx=ctx,
-        index_html=load_index_html(ctx.silence_detect_default, ctx.vad_mode_default),
+    ctx, service, start_time = prepare_server_components(
+        args=args,
+        perf_counter=time.perf_counter,
+        validate_tls=validate_tls_paths,
+        validate_chunk=validate_chunk_config,
+        create_context_fn=create_context,
+        load_index_html_fn=load_index_html,
+        service_factory=lambda *, ctx, index_html: AudioStreamService(
+            ctx=ctx,
+            index_html=index_html,
+        ),
     )
     return ctx, service, start_time
 
