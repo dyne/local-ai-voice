@@ -5,17 +5,9 @@ import pathlib
 import sys
 import time
 
-import numpy as np
-
 from local_ai.slices.voice.shared.audio_processing import (
     NR_IMPORT_ERROR,
-    TARGET_SAMPLE_RATE,
     create_audio_preprocessor,
-    ensure_sample_rate,
-    normalize_audio_format,
-    preprocess_audio,
-    read_wav_mono_float32,
-    resample_audio_linear,
     VAD_HANGOVER_MS,
     VAD_MIN_SPEECH_FRAMES,
     VAD_MIN_SPEECH_RATIO,
@@ -24,11 +16,11 @@ from local_ai.slices.voice.shared.audio_processing import (
 )
 from local_ai.slices.voice.shared.transcript_policy import (
     setup_error_exit_code,
-    should_suppress_transcript,
-    transcribe_chunk,
 )
 from local_ai.slices.voice.transcribe_file.request import TranscribeFileRequest
 from local_ai.slices.voice.transcribe_file.service import execute_transcribe_file
+from local_ai.slices.voice.transcribe_live.request import TranscribeLiveRequest
+from local_ai.slices.voice.transcribe_live.service import execute_transcribe_live
 from network_guard import enable_loopback_only_network
 from pyspy_profile import start_py_spy_profile, stop_py_spy_profile
 from local_ai.infrastructure.openvino.whisper import (
@@ -127,88 +119,30 @@ def run_live_mode(
     generate_kwargs: dict[str, object],
     start: float,
 ) -> int:
-    if args.chunk_seconds <= 0:
-        return fail("--chunk-seconds must be > 0.", exit_code=2)
-
     try:
         import sounddevice as sd
     except Exception as exc:
-        return fail(
-            "Live mode requires sounddevice.",
-            [f"Import error: {exc}", "Install sounddevice or pass a WAV file instead."],
-            exit_code=6,
-        )
+        sd = exc
 
-    try:
-        default_input = sd.query_devices(kind="input")
-        record_sample_rate = int(round(float(default_input["default_samplerate"])))
-    except Exception as exc:
-        return fail(
-            "Could not read default input sample rate.",
-            [f"Runtime error: {exc}", "Check your default microphone device settings."],
-            exit_code=7,
-        )
-
-    if record_sample_rate <= 0:
-        return fail("Default input sample rate is invalid.", [f"Detected: {record_sample_rate}"], exit_code=7)
-
-    chunk_samples = int(round(args.chunk_seconds * record_sample_rate))
-    if chunk_samples <= 0:
-        return fail("Computed chunk size is invalid; increase --chunk-seconds.", exit_code=2)
-
-    print("Live transcription started. Press Ctrl+C to stop.", file=sys.stderr, flush=True)
-    log(
-        f"Recording {record_sample_rate} Hz mono; transcribing every {args.chunk_seconds:.2f}s.",
-        args.verbose,
-        start,
+    response = execute_transcribe_live(
+        request=TranscribeLiveRequest(
+            chunk_seconds=args.chunk_seconds,
+            silence_detect=args.silence_detect,
+            verbose=args.verbose,
+        ),
+        sounddevice_module=sd,
+        pipe=pipe,
+        audio_preprocessor=audio_preprocessor,
+        generate_kwargs=generate_kwargs,
+        start=start,
+        logger=log,
+        runtime_error_details=likely_reason_details,
+        on_output=lambda line: print(line, flush=True),
+        on_status=lambda line: print(line, file=sys.stderr, flush=True),
     )
-
-    try:
-        with sd.InputStream(
-            samplerate=record_sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=chunk_samples,
-        ) as stream:
-            chunk_index = 0
-            while True:
-                data, overflowed = stream.read(chunk_samples)
-                chunk_index += 1
-                if overflowed:
-                    log("Audio input overflow detected; transcription may skip samples.", args.verbose, start)
-
-                audio = np.asarray(data[:, 0], dtype=np.float32)
-                if np.max(np.abs(audio), initial=0.0) < 1e-4:
-                    continue
-                try:
-                    audio = preprocess_audio(audio, record_sample_rate, audio_preprocessor, args.verbose, start, log)
-                except Exception as exc:
-                    return fail(
-                        "Live audio preprocessing failed.",
-                        [f"Runtime error: {exc}", NR_IMPORT_ERROR],
-                        exit_code=6,
-                    )
-                if args.silence_detect and audio.size == 0:
-                    continue
-                if record_sample_rate != TARGET_SAMPLE_RATE:
-                    audio = resample_audio_linear(audio, record_sample_rate, TARGET_SAMPLE_RATE)
-
-                try:
-                    text = transcribe_chunk(pipe, audio, generate_kwargs)
-                except Exception as exc:
-                    return fail("Live transcription failed.", likely_reason_details(exc), exit_code=5)
-
-                if text and not should_suppress_transcript(text, audio_preprocessor):
-                    print(f"[chunk {chunk_index}] {text}", flush=True)
-    except KeyboardInterrupt:
-        print("\nStopped live transcription.", file=sys.stderr, flush=True)
-        return 0
-    except Exception as exc:
-        return fail(
-            "Failed to capture microphone audio.",
-            [f"Runtime error: {exc}", "Check microphone permissions and input device availability."],
-            exit_code=7,
-        )
+    if response.exit_code != 0:
+        return fail(response.reason or "Live transcription failed.", response.details, exit_code=response.exit_code)
+    return response.exit_code
 
 
 def build_transcribe_parser(*, include_web_flag: bool = False) -> argparse.ArgumentParser:

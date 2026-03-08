@@ -1,0 +1,1 @@
+"""Voice live transcription slice."""
