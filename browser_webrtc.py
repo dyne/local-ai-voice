@@ -33,6 +33,7 @@ from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.inference_runner import run_chunk_inference
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
+from local_ai.slices.voice.web_ui.message_processor import process_audio_message
 from local_ai.slices.voice.web_ui.runtime_context import create_server_context
 from local_ai.slices.voice.web_ui.session_decoder import decode_session_message
 from local_ai.slices.voice.web_ui.session_registry import (
@@ -199,45 +200,6 @@ class AudioStreamService:
                 if session.received_messages <= 4:
                     size = len(raw) if raw else 0
                     await self._debug(session, f"received blob #{session.received_messages} bytes={size}")
-                decoded = self._decode_audio_message(session, message)
-                if decoded is None:
-                    if session.received_messages <= 4:
-                        await self._debug(session, f"blob #{session.received_messages} not decodable yet buffer={len(session.encoded_buffer)}")
-                    continue
-                audio, sample_rate = decoded
-                session.decoded_messages += 1
-                if session.decoded_messages <= 4:
-                    await self._debug(
-                        session,
-                        f"decoded chunk #{session.decoded_messages} samples={audio.size} sample_rate={sample_rate} buffer_after={len(session.encoded_buffer)}",
-                    )
-                if audio.size == 0:
-                    continue
-                prepared = prepare_stream_chunks(
-                    request=TranscribeStreamChunkRequest(
-                        incoming_audio=audio,
-                        incoming_sample_rate=sample_rate,
-                        buffered_audio=buffered,
-                        current_stream_sample_rate=session.stream_sample_rate,
-                        chunk_seconds=session.chunk_seconds,
-                        overlap_seconds=session.overlap_seconds,
-                        silence_detect=session.silence_detect,
-                        audio_preprocessor=session.audio_preprocessor,
-                        verbose=self.ctx.verbose,
-                        start=self.ctx.start_time,
-                    ),
-                    logger=log,
-                )
-                buffered = prepared.buffered_audio
-                session.stream_sample_rate = prepared.stream_sample_rate
-                if prepared.error is not None:
-                    await session.queue.put("[server error] Invalid chunk configuration.")
-                    await self._cleanup_session(session)
-                    return
-
-                if prepared.rejected_by_preprocessor and session.model_chunks == 0:
-                    await self._debug(session, "chunk rejected by preprocessing/VAD before model input")
-
                 async def infer_for_chunk(*, chunk: np.ndarray, audio_preprocessor: object | None) -> object:
                     return await run_chunk_inference(
                         chunk=chunk,
@@ -251,14 +213,32 @@ class AudioStreamService:
                         to_thread_fn=asyncio.to_thread,
                     )
 
-                await process_prepared_chunks(
+                async def process_chunks(*, session: SessionState, chunks: list[np.ndarray]) -> None:
+                    await process_prepared_chunks(
+                        session=session,
+                        chunks=chunks,
+                        target_sample_rate=TARGET_SAMPLE_RATE,
+                        append_capture_audio_fn=append_capture_audio,
+                        run_chunk_inference_fn=infer_for_chunk,
+                        debug_fn=self._debug,
+                    )
+
+                result = await process_audio_message(
                     session=session,
-                    chunks=prepared.model_inputs,
-                    target_sample_rate=TARGET_SAMPLE_RATE,
-                    append_capture_audio_fn=append_capture_audio,
-                    run_chunk_inference_fn=infer_for_chunk,
+                    message=message,
+                    buffered_audio=buffered,
+                    verbose=self.ctx.verbose,
+                    start_time=self.ctx.start_time,
+                    logger=log,
                     debug_fn=self._debug,
+                    decode_audio_message_fn=self._decode_audio_message,
+                    prepare_stream_chunks_fn=prepare_stream_chunks,
+                    process_prepared_chunks_fn=process_chunks,
+                    cleanup_session_fn=self._cleanup_session,
                 )
+                buffered = result.buffered_audio
+                if result.stop:
+                    return
         except WebSocketDisconnect:
             pass
         except Exception as exc:
