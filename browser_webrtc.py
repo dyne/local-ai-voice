@@ -27,8 +27,8 @@ from local_ai.slices.voice.transcribe_stream.service import prepare_stream_chunk
 from local_ai.slices.voice.web_ui.audio_decode import try_decode_bytes
 from local_ai.slices.voice.web_ui.capture_store import (
     append_capture_audio,
-    close_capture_writer,
 )
+from local_ai.slices.voice.web_ui.session_cleanup import cleanup_session
 from local_ai.slices.voice.web_ui.event_stream import event_stream
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_url, wait_for_server
 from local_ai.slices.voice.web_ui.session_registry import (
@@ -326,23 +326,7 @@ class AudioStreamService:
             yield item
 
     async def _cleanup_session(self, session: SessionState) -> None:
-        if session.audio_socket is not None:
-            try:
-                await session.audio_socket.close()
-            except Exception:
-                pass
-            session.audio_socket = None
-
-        saved_path = close_capture_writer(session)
-        if saved_path is not None:
-            capture_rate = float(session.capture_sample_rate or TARGET_SAMPLE_RATE)
-            duration = session.capture_samples / capture_rate
-            try:
-                session.queue.put_nowait(f"[server] saved WAV capture: {saved_path} ({duration:.2f}s)")
-            except Exception:
-                pass
-
-        self.sessions.pop(session.session_id, None)
+        await cleanup_session(session=session, sessions=self.sessions, target_sample_rate=TARGET_SAMPLE_RATE)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

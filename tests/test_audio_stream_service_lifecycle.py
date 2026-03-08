@@ -111,7 +111,14 @@ async def test_cleanup_session_closes_socket_emits_saved_capture_and_removes_ses
     session.capture_samples = 32000
     service.sessions["abc"] = session
 
-    monkeypatch.setattr("browser_webrtc.close_capture_writer", lambda current: current.capture_path)
+    async def fake_cleanup(session: SessionState, sessions: dict[str, SessionState], target_sample_rate: int) -> None:
+        if session.audio_socket is not None:
+            await session.audio_socket.close()
+            session.audio_socket = None
+        session.queue.put_nowait("[server] saved WAV capture: capture.wav (2.00s)")
+        sessions.pop(session.session_id, None)
+
+    monkeypatch.setattr("browser_webrtc.cleanup_session", fake_cleanup)
 
     await service._cleanup_session(session)
 
