@@ -64,6 +64,7 @@ class AudioStreamService:
         self,
         ctx: ServerContext,
         index_html: str,
+        static_assets_dir: pathlib.Path | None = None,
         *,
         logger: Any = None,
         likely_reason_details_fn: Any = None,
@@ -71,6 +72,7 @@ class AudioStreamService:
     ) -> None:
         self.ctx = ctx
         self.index_html = index_html
+        self.static_assets_dir = static_assets_dir
         self.logger = logger or (lambda message, verbose, start_time: None)
         self.likely_reason_details_fn = likely_reason_details_fn or (lambda exc: ())
         self.to_thread_fn = to_thread_fn
@@ -99,6 +101,7 @@ class AudioStreamService:
 
         return build_browser_app(
             index_html=self.index_html,
+            static_assets_dir=self.static_assets_dir,
             create_session_handler=self._create_session,
             audio_handler=self._handle_audio_socket,
             events_handler=events,

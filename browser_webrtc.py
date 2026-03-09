@@ -9,7 +9,10 @@ import time
 
 from local_ai.slices.voice.web_ui.launch_helpers import fallback_message, find_free_port, wait_for_server
 from local_ai.slices.voice.web_ui.launch_modes import run_desktop_mode, run_server_mode
-from local_ai.slices.voice.web_ui.page_loader import load_index_html as load_browser_index_html
+from local_ai.slices.voice.web_ui.page_loader import (
+    load_index_html as load_browser_index_html,
+    resolve_static_assets_dir,
+)
 from local_ai.slices.voice.web_ui.runtime_context import create_server_context
 from local_ai.slices.voice.web_ui.server_bootstrap import prepare_server_components
 from local_ai.slices.voice.web_ui.server_config import (
@@ -32,7 +35,14 @@ from local_ai_voice import (
 )
 from local_ai.infrastructure.openvino.whisper import create_whisper_runtime, likely_reason_details
 
-UI_PATH = pathlib.Path(__file__).resolve().parent / "web" / "index.html"
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def resolve_ui_path(*, base_dir: pathlib.Path) -> pathlib.Path:
+    built_ui_path = base_dir / "frontend" / "dist" / "index.html"
+    if built_ui_path.exists():
+        return built_ui_path
+    return base_dir / "web" / "index.html"
 
 
 def create_context(args: argparse.Namespace, start_time: float) -> ServerContext:
@@ -42,7 +52,7 @@ def create_context(args: argparse.Namespace, start_time: float) -> ServerContext
         configure_runtime_env=configure_openvino_runtime_env,
         create_runtime=create_whisper_runtime,
         logger=log,
-        base_dir=pathlib.Path(__file__).resolve().parent,
+        base_dir=BASE_DIR,
         context_factory=ServerContext,
         lock_factory=asyncio.Lock,
     )
@@ -91,6 +101,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def prepare_server(args: argparse.Namespace) -> tuple[ServerContext, AudioStreamService, float]:
+    ui_path = resolve_ui_path(base_dir=BASE_DIR)
+    static_assets_dir = resolve_static_assets_dir(ui_path=ui_path)
     ctx, service, start_time = prepare_server_components(
         args=args,
         perf_counter=time.perf_counter,
@@ -98,13 +110,14 @@ def prepare_server(args: argparse.Namespace) -> tuple[ServerContext, AudioStream
         validate_chunk=validate_chunk_config,
         create_context_fn=create_context,
         load_index_html_fn=lambda silence_detect_default, vad_mode_default: load_browser_index_html(
-            ui_path=UI_PATH,
+            ui_path=ui_path,
             silence_detect_default=silence_detect_default,
             vad_mode_default=vad_mode_default,
         ),
         service_factory=lambda *, ctx, index_html: AudioStreamService(
             ctx=ctx,
             index_html=index_html,
+            static_assets_dir=static_assets_dir,
             logger=log,
             likely_reason_details_fn=likely_reason_details,
         ),

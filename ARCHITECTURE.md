@@ -1,313 +1,259 @@
 # Architecture
 
-## Goals
+## Status
 
-- Keep device detection, model resolution, cache reuse, downloads, and runtime bootstrap in one reusable core.
-- Build user-facing capabilities as vertical slices on top of that core.
-- Preserve current voice behavior while creating a stable path for OCR, image generation, chat, and agentic workflows.
-- Prefer simple explicit boundaries over generic frameworks.
+This document now reflects the current repository state, not just the target design.
 
-## Architectural Principles
+The repository has already been refactored from a mostly monolithic voice application into:
 
-- `VSA`: organize by use-case slice, not by technical layer alone.
-- `REPR`: each CLI command or HTTP route has its own request, endpoint, and response contract.
-- `Hex`: domain and application logic depend on ports; infrastructure provides adapters.
-- `Light DDD`: use shared domain language, enforce invariants near the domain, and emit small operational domain events.
-- `HTMX first`: use server-rendered HTML and HTMX where browser APIs are not required; use focused JavaScript only for cases like microphone/WebRTC streaming.
+- a small shared Local AI core for device and model handling
+- an OpenVINO-specific infrastructure layer
+- vertical voice slices for file, live, stream, and browser UI flows
+- thin compatibility entrypoints that preserve the existing CLI and desktop/server behavior
 
-## Target Topology
+The current implementation is voice-first. OCR, image generation, chat, and agent slices are planned but not implemented yet.
+
+## Design Summary
+
+The codebase follows four practical architectural rules:
+
+- `VSA`: organize by use-case slices instead of broad layer-first files
+- `REPR`: make each transport path explicit through request/service/response style boundaries
+- `Hex`: keep domain and orchestration code separated from infrastructure and transport details
+- `Light DDD`: use stable names, explicit invariants, and small operational events/decisions close to the domain
+
+The intent is simple reuse:
+
+- shared code decides device selection and model resolution once
+- infrastructure code builds OpenVINO runtimes once
+- slices own user-facing behavior for one concrete use-case at a time
+
+## Current Topology
 
 ```text
 local_ai/
   shared/
     domain/
       devices.py
-      models.py
-      runtimes.py
       errors.py
-      events.py
-      types.py
-    application/
-      ports/
-        device_catalog.py
-        model_store.py
-        runtime_factory.py
-        event_bus.py
-        profiler.py
-        clock.py
-    infrastructure/
-      openvino/
-        adapters/
-          device_catalog.py
-          model_store.py
-          whisper_runtime_factory.py
-          llm_runtime_factory.py
-          diffusion_runtime_factory.py
-          ocr_runtime_factory.py
-      local/
-        adapters/
-          stderr_event_bus.py
-          pyspy_profiler.py
-    bootstrap/
-      container.py
-      settings.py
+      models.py
+
+  infrastructure/
+    openvino/
+      runtime_env.py
+      whisper.py
 
   slices/
     voice/
-      transcribe_file/
-        domain.py
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_http.py
-      transcribe_live/
-        domain.py
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_ws.py
-      web_ui/
-        endpoint_http.py
-        templates/
+      entrypoint.py
+      transcribe_runner.py
       shared/
         audio_processing.py
         transcript_policy.py
+      transcribe_file/
+        request.py
+        response.py
+        service.py
+      transcribe_live/
+        request.py
+        response.py
+        service.py
+      transcribe_stream/
+        buffer_decoder.py
+        request.py
+        response.py
+        service.py
+      web_ui/
+        app_factory.py
+        audio_decode.py
+        capture_store.py
+        chunk_pipeline.py
+        event_stream.py
+        inference_runner.py
+        launch_helpers.py
+        launch_modes.py
+        message_processor.py
+        page_loader.py
+        runtime_context.py
+        server_bootstrap.py
+        server_config.py
+        service.py
+        session_cleanup.py
+        session_decoder.py
+        session_registry.py
+        session_state.py
+        socket_loop.py
 
-    ocr/
-      recognize_image/
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_http.py
-
-    image/
-      generate_image/
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_http.py
-
-    chat/
-      generate_text/
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_http.py
-      chat_session/
-        request.py
-        response.py
-        service.py
-        endpoint_http.py
-
-    agent/
-      run_agent/
-        request.py
-        response.py
-        service.py
-        endpoint_cli.py
-        endpoint_http.py
-      tool_invocation/
-        request.py
-        response.py
-        service.py
-
-app/
-  cli.py
-  http.py
+local-ai-voice.py
+local_ai_voice.py
+browser_webrtc.py
+voice_runtime.py
 ```
+
+## Current Responsibilities
+
+### Shared Domain
+
+`local_ai/shared/domain` contains the reusable core.
+
+- `devices.py`: device parsing, normalization, availability checks, and selection
+- `models.py`: model reference parsing, default model selection, Hugging Face cache reuse, offline/download policy, model directory validation
+- `errors.py`: shared domain/runtime-facing exceptions used across the refactor
+
+This layer should stay free of FastAPI, pywebview, WebRTC, and OpenVINO-specific code.
+
+### Infrastructure
+
+`local_ai/infrastructure/openvino` contains OpenVINO-specific runtime bootstrap.
+
+- `whisper.py`: build and configure Whisper/OpenVINO runtime objects
+- `runtime_env.py`: runtime environment setup shared by CLI and browser flows
+
+This layer is where provider details belong. The rest of the code should not need to know about low-level OpenVINO setup.
+
+### Voice Slices
+
+`local_ai/slices/voice` contains the current vertical slices.
+
+- `transcribe_file`: file transcription request/response/service flow
+- `transcribe_live`: microphone/live transcription request/response/service flow
+- `transcribe_stream`: reusable chunk/window preparation for incremental streaming
+- `shared`: voice-specific audio invariants and transcript shaping
+- `web_ui`: browser transport, session lifecycle, stream decode, chunk orchestration, server bootstrap, and desktop/server launch support
+
+### Compatibility Entrypoints
+
+Top-level scripts still exist to preserve stable behavior:
+
+- `local-ai-voice.py`: public script entrypoint
+- `local_ai_voice.py`: CLI argument parsing and dispatch shell
+- `browser_webrtc.py`: compatibility facade for browser/server startup
+- `voice_runtime.py`: compatibility facade for shared runtime/model/device logic
+
+The goal is to keep these thin and behaviorally stable while the canonical implementation lives under `local_ai/`.
 
 ## Ubiquitous Language
 
-These names should stay stable across code, docs, logs, and CLI output.
+These terms should stay stable in code and docs:
 
-- `Capability`: a concrete model-backed use-case such as `voice.whisper`, `chat.llm`, `ocr.vision`, `image.diffusion`.
-- `DevicePreference`: ordered device intent such as `NPU,GPU,CPU`.
-- `DeviceSelection`: selected device plus the detected device inventory.
-- `ModelReference`: either a local model path or a Hugging Face repo id.
-- `ModelArtifact`: a validated local model directory ready for runtime construction.
-- `ResolutionPolicy`: rules such as offline mode and whether download is allowed.
-- `RuntimeSession`: an initialized provider runtime bound to a capability, device, and model artifact.
-- `InferenceRequest`: normalized input for one capability.
-- `InferenceResult`: normalized output for one capability.
+- `DevicePreference`: ordered user preference such as `NPU,GPU,CPU`
+- `DeviceSelection`: resolved device plus detected device inventory
+- `ModelReference`: either a local path or a Hugging Face repo id
+- `ModelArtifact`: validated local model directory
+- `ResolutionPolicy`: offline/download rules
+- `Voice Runtime`: initialized Whisper runtime on a selected OpenVINO device
+- `Slice`: one concrete use-case with its own request/service/response boundary
+- `Session`: browser live-transcription state bound to sockets, buffers, queues, and capture state
 
-## Shared Invariants
+## Invariants
 
-- Explicit `--model` never silently falls back to another model.
-- Offline mode never downloads.
-- Missing default models may be resolved from the shared Hugging Face cache before downloading.
-- A model artifact is only valid if it contains the required files for its capability.
-- OpenVINO remains the runtime backend for NPU, GPU, and CPU execution.
+### Shared Invariants
+
+- explicit `--model` must never silently fall back
+- offline mode must never download
+- default models may resolve from the Hugging Face cache before downloading
+- resolved model directories must contain the required files
+- runtime execution remains on OpenVINO for NPU, GPU, and CPU
 
 ### Voice Invariants
 
-- Always resample to `16000 Hz` before Whisper inference.
-- Always use mono `float32` audio for inference.
-- Browser audio flow remains decode -> denoise -> VAD -> final `16000 Hz` resample.
-- CLI flags and error semantics remain stable during migration.
+- audio must be mono `float32`
+- Whisper input must be resampled to `16000 Hz`
+- browser flow must remain decode -> denoise -> VAD -> final `16000 Hz` resample
+- CLI flags and default modes must remain stable
+- startup should print selected device and resolved model path to `stderr`
 
-## Hexagonal Boundaries
+## How VSA + REPR Show Up In The Current Code
 
-### Core Ports
+The repository does not yet have a full transport-agnostic port package, but the refactor already applies the pattern in practice.
 
-```python
-class DeviceCatalogPort(Protocol):
-    def list_available(self) -> list[str]: ...
-    def select(self, preference: str) -> DeviceSelection: ...
+Examples:
 
+- `transcribe_file/request.py` + `service.py` + `response.py`
+- `transcribe_live/request.py` + `service.py` + `response.py`
+- `transcribe_stream/request.py` + `service.py` + `response.py`
 
-class ModelStorePort(Protocol):
-    def resolve(self, capability: str, reference: ModelReference | None, device: str, policy: ResolutionPolicy) -> ModelArtifact: ...
+The top-level transport code builds requests, calls slice services, and formats outputs. This keeps core behavior testable without spinning up the full app.
 
+## Hexagonal Boundary In Practice
 
-class RuntimeFactoryPort(Protocol):
-    def create(self, capability: str, artifact: ModelArtifact, device: DeviceSelection) -> RuntimeSession: ...
+The repository currently uses a pragmatic, partial hexagonal split:
 
+- domain modules own validation and resolution rules
+- infrastructure modules own OpenVINO runtime construction
+- web/CLI modules own transport and startup behavior
 
-class EventBusPort(Protocol):
-    def publish(self, event: DomainEvent) -> None: ...
-```
+The boundary is not yet formalized as `ports/` and `adapters/` packages, but the code is now shaped so that those ports can be introduced incrementally without large rewrites.
 
-### Adapters
+That is an intentional design choice: keep the code concrete while extracting stable seams first.
 
-- OpenVINO device enumeration adapter
-- Hugging Face cache/download model store adapter
-- OpenVINO runtime factories per capability
-- stderr/local profiling/event adapters
+## Browser Architecture
 
-The domain and application layers must not import FastAPI, pywebview, WebRTC, Hugging Face Hub, or OpenVINO directly.
+The browser stack has been decomposed into small modules under `local_ai/slices/voice/web_ui`.
 
-## VSA + REPR Slice Pattern
+Current responsibilities are roughly:
 
-Each use-case slice owns:
+- `app_factory.py`: FastAPI app assembly
+- `server_bootstrap.py` and `launch_modes.py`: server and desktop/browser launch setup
+- `service.py`: browser session/service shell
+- `session_registry.py`, `session_cleanup.py`, `session_state.py`: session lifecycle and registry ownership
+- `audio_decode.py`, `session_decoder.py`, `buffer_decoder.py`: streamed audio decode path
+- `chunk_pipeline.py`, `inference_runner.py`, `message_processor.py`, `socket_loop.py`: websocket message handling and chunk inference orchestration
+- `capture_store.py`: optional WAV capture persistence
+- `event_stream.py`: server-sent event queue streaming
 
-- `request.py`: validated input DTOs
-- `response.py`: explicit output DTOs
-- `service.py`: orchestration using ports
-- `endpoint_cli.py` and/or `endpoint_http.py`: transport-specific glue
-- `domain.py`: capability-specific value objects and invariants when needed
+This is the most complex part of the repository, and the refactor intentionally broke it into narrow, testable seams before changing behavior.
 
-Example:
+## Testing State
 
-```text
-slices/voice/transcribe_file/
-  request.py
-  response.py
-  service.py
-  endpoint_cli.py
-```
+The refactor has been accompanied by pytest-based unit coverage around the extracted modules.
 
-The endpoint builds a request object, calls the service, and returns a response object. Transport code stays out of domain logic.
+The test suite currently covers:
 
-## Domain Events
+- device parsing and selection
+- model resolution and Hugging Face cache behavior
+- OpenVINO runtime environment setup
+- file and live slice services
+- stream buffering and chunk preparation
+- browser session lifecycle helpers
+- browser launch/bootstrap helpers
+- browser decode/message/chunk/socket helper flows
+- packaging/spec regression checks for frozen builds
 
-Use small operational events for observability and future UI hooks:
+The architecture depends on preserving this test-first approach for future slices.
 
-- `DeviceSelected`
-- `ModelResolvedFromCache`
-- `ModelDownloaded`
-- `RuntimeCreated`
-- `InferenceStarted`
-- `InferenceCompleted`
-- `InferenceFailed`
+## Current Design Choices
 
-This is not event sourcing. Events exist for diagnostics, profiling, and incremental UX improvements.
+### Why Keep Compatibility Facades
 
-## UI Strategy
+The project still exposes the historical scripts because the user-facing interface is already useful and should not churn while internals are refactored.
 
-Use HTMX for:
+### Why Voice-First
 
-- OCR upload/result pages
-- chat request/response forms
-- image generation forms and polling
-- diagnostics/model management pages
+The only implemented capability is voice, so the architecture stays concrete and optimized around real behavior. OCR, image, chat, and agent support should be added only when the first real slice exists.
 
-Use focused JavaScript where browser APIs force it:
+### Why No Heavy DI Framework
 
-- microphone capture
-- MediaRecorder / WebRTC
-- websocket audio streaming
+The repository is still small enough that explicit imports and thin wrappers are easier to maintain than a container framework.
 
-Voice live transcription should keep the current JS capture path; surrounding UI can still move toward server-rendered pages and HTMX-backed partials later.
+### Why HTMX Is Only A Future Partial Fit
 
-## CLI and HTTP Shape
+HTMX is a good fit for server-rendered upload/result flows and diagnostics pages, but not for microphone capture and websocket/WebRTC audio transport. Live browser transcription still needs focused JavaScript.
 
-Long term, move toward one unified entrypoint:
+## Next Steps
 
-```text
-local-ai voice ...
-local-ai voice --server ...
-local-ai ocr ...
-local-ai image ...
-local-ai chat ...
-local-ai agent ...
-local-ai devices list
-local-ai models resolve ...
-```
+The next architectural steps should be incremental:
 
-Common flags:
-
-- `--device`
-- `--model`
-- `--offline`
-- `--verbose`
-- `--profile`
-
-Capability-specific flags remain within each slice.
-
-Suggested HTTP examples:
-
-- `GET /voice`
-- `POST /voice/transcribe-file`
-- `WS /voice/live/{session_id}`
-- `POST /ocr/recognize`
-- `POST /chat/message`
-- `POST /image/generate`
-- `GET /image/jobs/{id}`
-
-## Migration Strategy
-
-### Phase 1: Extract the Shared Spine
-
-- Create `local_ai/shared/domain` for errors, devices, and models.
-- Create `local_ai/infrastructure/openvino` for Whisper runtime construction.
-- Turn `voice_runtime.py` into a compatibility layer that re-exports from the new package.
-
-### Phase 2: Slice the Voice Application
-
-- Split voice into `transcribe_file` and `transcribe_live` slices.
-- Move audio preprocessing into `slices/voice/shared`.
-- Keep current CLI/web entrypoints as thin adapters while preserving flags and behavior.
-
-### Phase 3: Introduce Bootstrap
-
-- Add a lightweight dependency container in `bootstrap/container.py`.
-- Resolve ports to adapters in one place.
-- Keep wiring explicit and local.
-
-### Phase 4: Add New Capabilities
-
-- Add OCR, image generation, chat, and agent slices one by one.
-- Reuse the same ports for device selection, model resolution, and runtime creation.
-- Add provider adapters only when a capability actually exists.
+1. Keep shrinking top-level compatibility files as behavior stays stable.
+2. Introduce explicit application ports only when at least two slices benefit from the abstraction.
+3. Add the next capability as a real vertical slice, likely OCR or chat.
+4. Add a lightweight bootstrap/container only when multiple capabilities need shared wiring.
+5. Move toward a unified `local-ai` CLI entrypoint once voice compatibility no longer depends on the legacy script layout.
 
 ## What To Avoid
 
-- A giant shared `utils.py`
-- One generic `InferenceService` for all tasks
-- Deep inheritance trees
-- Domain services importing transport or provider libraries
-- Abstracting future capabilities before their first real use-case exists
-
-## Current First Refactor
-
-The first concrete refactor for this repository is:
-
-1. Save this architecture document.
-2. Extract device selection, model resolution, and Whisper runtime creation into the new `local_ai` package.
-3. Keep `local-ai-voice.py`, [local_ai_voice.py](/abs/path/C:/Users/denis/devel/local-ai-voice/local_ai_voice.py), [browser_webrtc.py](/abs/path/C:/Users/denis/devel/local-ai-voice/browser_webrtc.py), and [voice_runtime.py](/abs/path/C:/Users/denis/devel/local-ai-voice/voice_runtime.py) behaviorally stable while rewiring imports.
-4. Validate with `py_compile` and targeted runtime resolution checks before continuing into deeper slice extraction.
+- reintroducing large monolithic utility modules
+- abstract interfaces without a second real consumer
+- mixing transport, runtime construction, and domain validation in one file
+- changing CLI/browser behavior during structural refactors unless covered and intentional
+- building generic future capability scaffolding before a real use-case exists
