@@ -40,9 +40,12 @@ jobs:
             --hidden-import av `
             --hidden-import noisereduce `
             --hidden-import webrtcvad `
+            --hidden-import uvicorn `
             --hidden-import webview `
             --hidden-import hf_xet `
             --additional-hooks-dir hooks `
+            --collect-submodules uvicorn `
+            --collect-submodules websockets `
             --collect-binaries openvino `
             --collect-data openvino `
             --collect-binaries openvino_genai `
@@ -120,9 +123,12 @@ jobs:
             --hidden-import av \
             --hidden-import noisereduce \
             --hidden-import webrtcvad \
+            --hidden-import uvicorn \
             --hidden-import webview \
             --hidden-import hf_xet \
             --additional-hooks-dir hooks \
+            --collect-submodules uvicorn \
+            --collect-submodules websockets \
             --collect-binaries openvino \
             --collect-data openvino \
             --collect-binaries openvino_genai \
