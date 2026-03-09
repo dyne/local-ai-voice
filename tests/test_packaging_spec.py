@@ -31,6 +31,7 @@ def test_github_release_workflow_includes_uvicorn_collection() -> None:
     assert "--collect-submodules uvicorn" in workflow_text
     assert "--collect-submodules websockets" in workflow_text
     assert "actions/setup-node@v4" in workflow_text
+    assert "npm --prefix frontend test" in workflow_text
     assert "npm --prefix frontend run build" in workflow_text
     assert '--add-data "frontend/dist;frontend/dist"' in workflow_text
     assert '--add-data "frontend/dist:frontend/dist"' in workflow_text

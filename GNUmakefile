@@ -24,7 +24,7 @@ OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
 NPM ?= npm
 FRONTEND_DIR := frontend
 
-.PHONY: all install install-build frontend-install frontend-build spec build build-webrtc run run-web run-server test clean
+.PHONY: all install install-build frontend-install frontend-test frontend-build spec build build-webrtc run run-web run-server test clean
 
 all: install
 
@@ -44,6 +44,9 @@ frontend-install:
 
 frontend-build: frontend-install
 	$(NPM) --prefix $(FRONTEND_DIR) run build
+
+frontend-test: frontend-install
+	$(NPM) --prefix $(FRONTEND_DIR) test
 
 spec: install-build frontend-build
 	$(PYTHON) -m PyInstaller.utils.cliutils.makespec --onefile --name $(APP_NAME) \
@@ -84,7 +87,7 @@ run-web:
 run-server:
 	$(PYTHON) $(SCRIPT) --server
 
-test:
+test: frontend-test
 	$(PYTHON) -m pytest
 
 clean:

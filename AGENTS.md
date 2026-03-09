@@ -164,6 +164,8 @@ Minimum validation for routine refactors:
 3. `cd frontend && npm test`
 4. `cd frontend && npm run build`
 
+`make test` should cover both frontend Vitest and backend pytest.
+
 Additional validation by change type:
 
 1. File transcription smoke test:
