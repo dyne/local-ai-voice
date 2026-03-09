@@ -9,6 +9,7 @@ The repository has already been refactored from a mostly monolithic voice applic
 - a small shared Local AI core for device and model handling
 - an OpenVINO-specific infrastructure layer
 - vertical voice slices for file, live, stream, and browser UI flows
+- a Svelte frontend that consumes the existing browser/server contracts
 - thin compatibility entrypoints that preserve the existing CLI and desktop/server behavior
 
 The current implementation is voice-first. OCR, image generation, chat, and agent slices are planned but not implemented yet.
@@ -88,6 +89,17 @@ local-ai-voice.py
 local_ai_voice.py
 browser_webrtc.py
 voice_runtime.py
+
+frontend/
+  package.json
+  vite.config.js
+  svelte.config.js
+  src/
+    App.svelte
+    main.js
+    lib/
+      runtime-config.js
+      session-payload.js
 ```
 
 ## Current Responsibilities
@@ -131,6 +143,15 @@ Top-level scripts still exist to preserve stable behavior:
 - `voice_runtime.py`: compatibility facade for shared runtime/model/device logic
 
 The goal is to keep these thin and behaviorally stable while the canonical implementation lives under `local_ai/`.
+
+### Frontend
+
+`frontend/` contains the browser UI implementation.
+
+- Svelte owns presentation, browser state, and microphone/session wiring in the page
+- Vite builds static assets into `frontend/dist`
+- the Python server serves the built app when `frontend/dist/index.html` exists
+- the old `web/index.html` remains as a fallback during migration and packaging transitions
 
 ## Ubiquitous Language
 
@@ -202,7 +223,31 @@ Current responsibilities are roughly:
 - `capture_store.py`: optional WAV capture persistence
 - `event_stream.py`: server-sent event queue streaming
 
+The backend browser slice now serves one of two frontend implementations:
+
+- preferred: built Svelte assets from `frontend/dist`
+- fallback: legacy `web/index.html`
+
 This is the most complex part of the repository, and the refactor intentionally broke it into narrow, testable seams before changing behavior.
+
+## Frontend Strategy
+
+The frontend migration uses Svelte, not SvelteKit.
+
+That choice is deliberate:
+
+- Python already owns the app server and the runtime-critical backend logic
+- the current browser API is already stable enough for a frontend swap
+- Svelte provides a cleaner UI/state model without introducing a second server framework
+
+Current frontend contract:
+
+- `POST /session`
+- `GET /events/{session_id}`
+- `WS /audio/{session_id}`
+- `DELETE /session/{session_id}`
+
+The Svelte app is expected to treat those routes as the source of truth and avoid moving runtime logic into the browser.
 
 ## Testing State
 
@@ -218,6 +263,8 @@ The test suite currently covers:
 - browser session lifecycle helpers
 - browser launch/bootstrap helpers
 - browser decode/message/chunk/socket helper flows
+- frontend runtime-config and session-payload helpers through Vitest
+- frontend selection of built assets over legacy HTML
 - packaging/spec regression checks for frozen builds
 
 The architecture depends on preserving this test-first approach for future slices.
@@ -240,15 +287,20 @@ The repository is still small enough that explicit imports and thin wrappers are
 
 HTMX is a good fit for server-rendered upload/result flows and diagnostics pages, but not for microphone capture and websocket/WebRTC audio transport. Live browser transcription still needs focused JavaScript.
 
+### Why Svelte Fits Now
+
+The backend browser contract is now narrow enough that the old inline HTML/JavaScript page can be replaced by a compiled frontend without changing inference or transport behavior. Svelte improves maintainability on the browser side while leaving device/model/runtime concerns in Python.
+
 ## Next Steps
 
 The next architectural steps should be incremental:
 
 1. Keep shrinking top-level compatibility files as behavior stays stable.
-2. Introduce explicit application ports only when at least two slices benefit from the abstraction.
-3. Add the next capability as a real vertical slice, likely OCR or chat.
-4. Add a lightweight bootstrap/container only when multiple capabilities need shared wiring.
-5. Move toward a unified `local-ai` CLI entrypoint once voice compatibility no longer depends on the legacy script layout.
+2. Complete the Svelte migration and remove the legacy inline browser page once packaging and startup paths are stable.
+3. Introduce explicit application ports only when at least two slices benefit from the abstraction.
+4. Add the next capability as a real vertical slice, likely OCR or chat.
+5. Add a lightweight bootstrap/container only when multiple capabilities need shared wiring.
+6. Move toward a unified `local-ai` CLI entrypoint once voice compatibility no longer depends on the legacy script layout.
 
 ## What To Avoid
 

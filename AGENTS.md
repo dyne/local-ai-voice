@@ -14,6 +14,10 @@ Current implementation also relies on these repository entry shells:
 
 Canonical implementation now lives under the `local_ai/` package.
 
+Browser UI implementation now also lives under:
+
+- `frontend/`
+
 ## Environment
 
 - Use Python `3.11` for install, validation, profiling, packaging, and test commands.
@@ -33,6 +37,8 @@ The repository is no longer a single-script implementation. It is now organized 
   - live transcription slice
   - streaming/chunking slice
   - browser/desktop web UI slice
+- `frontend`
+  - Svelte UI compiled by Vite and served by the Python browser backend when built
 - top-level compatibility shells
   - preserve the current CLI, `--server`, and desktop launch behavior
 
@@ -47,6 +53,13 @@ The current structure follows these rules:
 
 This is intentionally concrete. The repository is voice-first today, with architecture prepared for future OCR, image generation, chat, and agent modules when they become real slices.
 
+### Frontend Design
+
+- Svelte owns browser presentation and page-local state.
+- Python still owns session creation, event streaming, websocket audio ingestion, device/model selection, and inference.
+- The frontend must consume the existing backend contract instead of re-implementing backend behavior in the browser.
+- Prefer Svelte + Vite over SvelteKit because Python remains the only app server.
+
 ## Script Intent
 
 - Transcribe WAV files or microphone audio using OpenVINO GenAI Whisper.
@@ -57,6 +70,7 @@ This is intentionally concrete. The repository is voice-first today, with archit
 - `local-ai-voice.py --server` runs the raw browser server without the desktop wrapper.
 - `local-ai-voice.py --cli` forces the non-web CLI path for file or live microphone transcription.
 - Auto-download OpenVINO Whisper models from Hugging Face Hub and reuse the shared Hugging Face cache.
+- When available, the browser server should serve the built Svelte frontend from `frontend/dist`; otherwise it may fall back to the legacy `web/index.html`.
 
 ## Non-Negotiable Behavior
 
@@ -91,6 +105,7 @@ This is intentionally concrete. The repository is voice-first today, with archit
 - Support `HF_TOKEN` when present for authenticated Hugging Face downloads.
 - Include `huggingface_hub[hf_xet]` and `hf_xet` in packaging so frozen builds can use Xet-backed model downloads.
 - Frozen builds must also bundle dynamic web-server imports needed by browser/server mode, including `uvicorn` and websocket dependencies.
+- Frozen builds should eventually package the built frontend assets so desktop/server mode uses the same Svelte UI as source runs.
 - When adding, removing, or changing packaged runtime dependencies, keep all packaging entrypoints in sync:
   - update the checked-in `local-ai-voice.spec`
   - update the PyInstaller flags in `GNUmakefile`
@@ -130,17 +145,23 @@ Useful current module boundaries:
 - `local_ai/slices/voice/web_ui/`
 - `local_ai/slices/voice/entrypoint.py`
 - `local_ai/slices/voice/transcribe_runner.py`
+- `frontend/src/App.svelte`
+- `frontend/src/lib/runtime-config.js`
+- `frontend/src/lib/session-payload.js`
 
 When changing behavior, prefer editing the `local_ai/` package first and keep the top-level scripts as thin adapters.
 
 ## Testing Expectations
 
 Use pytest for new code and add unit coverage whenever extracting or changing logic.
+Use Vitest for frontend utility modules and browser-side state helpers.
 
 Minimum validation for routine refactors:
 
 1. `py -3.11 -m pytest`
 2. `py -3.11 -m py_compile local-ai-voice.py local_ai_voice.py voice_runtime.py browser_webrtc.py`
+3. `cd frontend && npm test`
+4. `cd frontend && npm run build`
 
 Additional validation by change type:
 
@@ -159,6 +180,9 @@ Additional validation by change type:
 6. Packaging regression check after frozen-build changes:
    - `py -3.11 -m pytest tests/test_packaging_spec.py`
    - rebuild and run `.\dist\local-ai-voice.exe` when packaging changes matter
+7. Frontend selection check after browser frontend changes:
+   - ensure `frontend/dist/index.html` is preferred over `web/index.html`
+   - run one browser startup path after a frontend build
    - if packaging dependencies changed, verify `.github/workflows/build-and-release.yaml` still matches `local-ai-voice.spec` and `GNUmakefile`
 
 ## Profiling
