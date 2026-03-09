@@ -106,6 +106,7 @@ This is intentionally concrete. The repository is voice-first today, with archit
 - Include `huggingface_hub[hf_xet]` and `hf_xet` in packaging so frozen builds can use Xet-backed model downloads.
 - Frozen builds must also bundle dynamic web-server imports needed by browser/server mode, including `uvicorn` and websocket dependencies.
 - Frozen builds should eventually package the built frontend assets so desktop/server mode uses the same Svelte UI as source runs.
+- `GNUmakefile`, `local-ai-voice.spec`, and the GitHub release workflow should build and package `frontend/dist` before freezing the executable.
 - When adding, removing, or changing packaged runtime dependencies, keep all packaging entrypoints in sync:
   - update the checked-in `local-ai-voice.spec`
   - update the PyInstaller flags in `GNUmakefile`

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('web/index.html', 'web')]
+datas = [('frontend/dist', 'frontend/dist'), ('web/index.html', 'web')]
 binaries = []
 hiddenimports = ['browser_webrtc', 'av', 'noisereduce', 'webrtcvad', 'uvicorn', 'webview', 'hf_xet']
 datas += collect_data_files('openvino')

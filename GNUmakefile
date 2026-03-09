@@ -21,8 +21,10 @@ APP_NAME := local-ai-voice
 SPEC := $(APP_NAME).spec
 REQUIREMENTS := numpy noisereduce webrtcvad-wheels sounddevice fastapi uvicorn websockets pydantic av pywebview huggingface_hub[hf_xet]
 OPENVINO_PACKAGES := openvino openvino-genai openvino-tokenizers
+NPM ?= npm
+FRONTEND_DIR := frontend
 
-.PHONY: all install install-build spec build build-webrtc run run-web run-server test clean
+.PHONY: all install install-build frontend-install frontend-build spec build build-webrtc run run-web run-server test clean
 
 all: install
 
@@ -37,7 +39,13 @@ install: $(VENV_PYTHON)
 install-build: $(VENV_PYTHON)
 	$(PIP) install pyinstaller
 
-spec: install-build
+frontend-install:
+	$(NPM) --prefix $(FRONTEND_DIR) ci
+
+frontend-build: frontend-install
+	$(NPM) --prefix $(FRONTEND_DIR) run build
+
+spec: install-build frontend-build
 	$(PYTHON) -m PyInstaller.utils.cliutils.makespec --onefile --name $(APP_NAME) \
 		--hidden-import browser_webrtc \
 		--hidden-import av \
@@ -58,6 +66,7 @@ spec: install-build
 		--collect-data webview \
 		--collect-binaries hf_xet \
 		--collect-data hf_xet \
+		--add-data "$(FRONTEND_DIR)/dist$(DATA_SEP)$(FRONTEND_DIR)/dist" \
 		--add-data "web/index.html$(DATA_SEP)web" \
 		$(SCRIPT)
 

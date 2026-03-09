@@ -152,6 +152,7 @@ The goal is to keep these thin and behaviorally stable while the canonical imple
 - Vite builds static assets into `frontend/dist`
 - the Python server serves the built app when `frontend/dist/index.html` exists
 - the old `web/index.html` remains as a fallback during migration and packaging transitions
+- build and release workflows are expected to build `frontend/dist` before packaging the executable
 
 ## Ubiquitous Language
 
